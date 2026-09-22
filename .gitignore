@@ -37,3 +37,6 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### 本地 H2 文件数据库与日志 ###
+data/
+*.log
