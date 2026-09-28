@@ -512,23 +512,25 @@ public class ReconciliationService {
             if (firedBefore != agg.isFired()) {
                 actionTypes.add("FIRED_CORRECTED");
             }
-            if (alertBefore == null) {
-                Instant reference = m.windowEvents().isEmpty()
-                        ? Instant.ofEpochSecond(agg.getWindowStart())
-                        : m.windowEvents().get(m.windowEvents().size() - 1).getEventTime();
-                alertAfter = alertService.ensureAlertForWindow(rule, windowKey, agg, reference);
+            Instant reference = m.windowEvents().isEmpty()
+                    ? Instant.ofEpochSecond(agg.getWindowStart())
+                    : m.windowEvents().get(m.windowEvents().size() - 1).getEventTime();
+            AlertService.EnsureAlertResult ensured =
+                    alertService.ensureAlertForWindow(rule, windowKey, agg, reference);
+            alertAfter = ensured.alertId();
+            if (ensured.created()) {
                 actionTypes.add("FIRE_ALERT_CREATED");
-                notes.add("达到阈值但缺告警，补建/关联告警 " + alertAfter);
-            } else {
-                // 已有关联：校验其仍包含本窗口，不包含则改挂回正确告警，绝不重复建警/累计
-                alertAfter = alertService.ensureAlertForWindow(
-                        rule, windowKey, agg,
-                        m.windowEvents().isEmpty() ? Instant.ofEpochSecond(agg.getWindowStart())
-                                : m.windowEvents().get(m.windowEvents().size() - 1).getEventTime());
-                if (!alertAfter.equals(alertBefore)) {
+            } else if (ensured.merged()) {
+                actionTypes.add("FIRE_ALERT_MERGED");
+            }
+            if (!alertAfter.equals(alertBefore)) {
+                // 关联为空时是补建/合并；关联非空但变了是错位改挂
+                if (alertBefore != null) {
                     actionTypes.add("ALERT_RELINKED");
-                    notes.add("告警关联错位，改挂告警 " + alertBefore + " -> " + alertAfter);
                 }
+                notes.add("告警关联 " + alertBefore + " -> " + alertAfter + "（" + ensured.note() + "）");
+            } else if (ensured.created()) {
+                notes.add("达到阈值但缺告警，补建告警 " + alertAfter);
             }
         } else {
             if (agg.isFired()) {

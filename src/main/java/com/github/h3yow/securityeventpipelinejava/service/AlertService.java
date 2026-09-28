@@ -157,10 +157,13 @@ public class AlertService {
      * </ol>
      * 调用方必须已持有该窗口锁并处于事务中。
      *
-     * @return 关联到的告警ID
+     * @return EnsureAlertResult：关联告警ID，created=是否新建，merged=是否并入既有活跃告警
      */
+    public record EnsureAlertResult(long alertId, boolean created, boolean merged, String note) {
+    }
+
     @Transactional
-    public long ensureAlertForWindow(RuleEntity rule, WindowKey windowKey,
+    public EnsureAlertResult ensureAlertForWindow(RuleEntity rule, WindowKey windowKey,
                                      WindowAggregateEntity aggregate,
                                      Instant referenceEventTime) {
         String windowKeyEncoded = windowKey.encode();
@@ -168,7 +171,7 @@ public class AlertService {
         if (aggregate.getMatchedAlertId() != null) {
             AlertEntity linked = alertRepository.findById(aggregate.getMatchedAlertId()).orElse(null);
             if (linked != null && linked.getWindowKeys().contains(windowKeyEncoded)) {
-                return linked.getId();
+                return new EnsureAlertResult(linked.getId(), false, false, "复用已关联告警");
             }
         }
         // 2) 其它告警已包含该窗口（关联错位的修复：改挂回去，绝不新建；窗口键已含分组，不再限组）
@@ -180,7 +183,7 @@ public class AlertService {
         if (owner != null) {
             aggregate.setMatchedAlertId(owner.getId());
             log.info("自愈: 窗口 {} 改关联到已包含该窗口的告警 {}", windowKeyEncoded, owner.getId());
-            return owner.getId();
+            return new EnsureAlertResult(owner.getId(), false, false, "关联错位，改挂到已包含本窗口的告警");
         }
         // 3) dedup 合并口径：与实时检测相同（基于窗口内最新事件时间）
         AlertEntity mergeTarget = alertRepository
@@ -190,7 +193,8 @@ public class AlertService {
                         a.getLastEventTime(), referenceEventTime).toSeconds()) <= rule.getDedupSeconds())
                 .findFirst().orElse(null);
         if (mergeTarget != null) {
-            if (!mergeTarget.getWindowKeys().contains(windowKeyEncoded)) {
+            boolean added = !mergeTarget.getWindowKeys().contains(windowKeyEncoded);
+            if (added) {
                 mergeTarget.setOccurrenceCount(mergeTarget.getOccurrenceCount() + 1);
                 mergeTarget.getWindowKeys().add(windowKeyEncoded);
             }
@@ -201,7 +205,8 @@ public class AlertService {
             alertRepository.save(mergeTarget);
             aggregate.setMatchedAlertId(mergeTarget.getId());
             log.info("自愈: 窗口 {} 合并进活跃告警 {}", windowKeyEncoded, mergeTarget.getId());
-            return mergeTarget.getId();
+            return new EnsureAlertResult(mergeTarget.getId(), false, true,
+                    added ? "合并进 dedup 间隔内的活跃告警" : "该告警已包含本窗口，仅建立关联不重复累计");
         }
         // 4) 新建
         AlertEntity alert = new AlertEntity();
@@ -226,7 +231,7 @@ public class AlertService {
                 "窗口自愈：去重事件数 " + aggregate.getCount() + " 达到阈值 " + rule.getThreshold()
                         + "，补建告警");
         log.info("自愈: 窗口 {} 补建告警 {}", windowKeyEncoded, saved.getId());
-        return saved.getId();
+        return new EnsureAlertResult(saved.getId(), true, false, "无适用告警，补建");
     }
 
     /**
