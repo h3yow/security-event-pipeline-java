@@ -14,7 +14,7 @@
 ```bash
 mvn spring-boot:run            # 或 mvn package && java -jar target/security-event-pipeline-1.0-SNAPSHOT.jar
 # 服务监听 http://localhost:8080，首次启动自动写入 3 条演示规则
-mvn test                       # 运行全部测试（13 个用例）
+mvn test                       # 运行全部测试（23 个用例）
 ```
 
 重置本地数据：停止服务后删除 `./data` 目录。
@@ -150,7 +150,10 @@ actor / action / target / sourceIp / attributes / rawPayload`。
 
 ### 3.3 计数在并发下不重不漏
 
-- JVM 内按窗口键（`ruleId#version#groupKey#windowStart`）加锁串行化同窗口更新；
+- JVM 内按窗口键（`ruleId#version#groupKey#windowStart`）加锁串行化同窗口更新，
+  且**锁覆盖整个数据库事务直到提交**（接入与自愈共用同一把锁，见 {@link WindowLockManager}）：
+  同一窗口几十条不同事件并发补录时，"读聚合→写关联→改计数"完全串行，
+  不会出现聚合行唯一约束冲突或计数丢失更新；
 - 关联表 `window_event(rule_id, window_key, event_id)` 有**唯一约束**，采用“先查后插 + 约束兜底”，
   保证每个事件对每个窗口只贡献一次计数；
 - 聚合计数与窗口-事件关联全部落库，**重启后继续累计**，不回退、不重复。
@@ -222,6 +225,9 @@ curl -X POST http://localhost:8080/api/alerts/1/transition \
 | `POST /api/alerts/{id}/transition` | 告警状态流转（需 X-Operator[-Role] 头） |
 | `GET  /api/audit/rejected` | 被拒绝记录审计（原因可区分） |
 | `GET  /api/audit/windows` | 窗口聚合计数（判定依据） |
+| `GET  /api/audit/windows/reconciliation` | **窗口对账**：三方比对 + 差异逐条列出（见第 8 节） |
+| `POST /api/audit/windows/repair` | **窗口自愈**：按已受理去重事件收敛统计/阈值/告警（见第 8 节） |
+| `GET  /api/audit/windows/repair/audits` | 自愈审计记录（何时/因何/处理了哪些窗口） |
 | `GET  /api/audit/alerts/{id}/transitions` | 告警状态流转审计 |
 
 ---
@@ -248,12 +254,16 @@ curl -X POST localhost:8080/api/alerts/1/transition -H 'X-Operator-Role: VIEWER'
   -H 'Content-Type: application/json' -d '{"targetStatus":"ACKNOWLEDGED"}'   # 403
 ```
 
-### 6.2 自动化测试（`mvn test`，共 14 个用例）
+### 6.2 自动化测试（`mvn test`，共 23 个用例）
 
 | 测试类 | 覆盖内容 |
 | --- | --- |
 | `NormalizerTest`（5） | 必填缺失、非法时间戳、时间戳越界、未知来源、正常归一化 |
 | `PipelineIntegrationTest`（5） | **16 线程并发同一事件只接受 1 次**；**乱序事件窗口计数稳定且只建 1 警**；**迟到超宽限被拒（WINDOW_EXPIRED）且拒绝留痕、事件不落库**；**非法流转(422)与越权(403)被正确归类、状态不变**；相邻窗口命中在 dedup 间隔内合并为 1 条告警 |
+| `ConcurrentBackfillTest`（2） | **50 条不同事件同窗口 16 线程并发补录：成功受理数=去重关联行=统计值=50，只建 1 警**；**40 不同事件 + 30 相同事件重试混合并发：受理 40、判重 30、计数 40** |
+| `ReconciliationQueryTest`（2） | 健康窗口三方对账一致且贡献可解释；人为制造 count 漂移/缺失关联/孤儿关联时差异被逐条列出 |
+| `WindowSelfHealTest`（4） | **修复收敛且重复触发幂等（0 变更、不重复建警、每次留审计）**；**未达阈值误报被删除且不会重建**；**8 并发修复仅第一次变更、最终一致**；跨分组错误并入的窗口归属被识别并解除（不误删真实告警） |
+| `ReconciliationHttpApiTest`（1） | 对账/自愈/审计列表端点状态码与响应体；未知规则版本 404 |
 | `RuleVersioningTest`（1） | 规则变更产生 v2、v1 保留；历史告警仍引用 v1 与阈值=4 的快照；新事件按 v2 判定 |
 | `RestartPersistenceTest`（1） | 两个 Spring 上下文顺序启动同一文件库：ACK 状态与计数重启后保留；重放旧事件仍判重且计数不变；新事件继续累计并关联原告警 |
 | `HttpApiTest`（1） | HTTP 层状态码/原因归类：400/409/403/422/404，响应体结构与审计端点 |
@@ -274,7 +284,134 @@ count/threshold/命中、拒绝原因）与**最终状态**（`[最终状态]`�
 
 ---
 
-## 7. 配置项（`src/main/resources/application.properties`）
+## 8. 窗口对账与自愈（运维）
+
+面向运维的"判定结果是否可信"与"发现偏差后一键收敛"能力。对账只读取证、不改动数据；
+自愈才会修改统计/告警，并对每次触发留审计。
+
+### 8.1 对账查询 `GET /api/audit/windows/reconciliation`
+
+查询参数（`ruleCode` 必填，其余可选）：
+
+| 参数 | 说明 |
+| --- | --- |
+| `ruleCode` | 规则编码，如 `AUTH_BRUTE_FORCE` |
+| `ruleVersion` | 限定**当时的规则版本**；不传则返回该规则全部版本的窗口（历史判定按各自版本重算） |
+| `groupKey` | 限定分组（如 `actor` 的值 `mallory`）；不传则全部 |
+| `from` / `to` | 窗口**起点**区间，ISO-8601，半开 `[from, to)`；不传不限 |
+
+对每个窗口做**三方比对**，结果稳定（按规则/版本/分组/窗口起点排序、事件按 eventId 排序）：
+
+- `storedCount`：`window_aggregate` 里当前统计值；
+- `actualUniqueCount`：`window_event` 去重关联行数——**这次判定实际纳入的唯一事件数**；
+- `expectedCount`：用**当时的规则版本**对已受理事件（`accepted_event`）重新匹配/分桶算出的理论值。
+
+差异不只给总数，而是逐条列出并给出布尔标记：
+
+- `missingEventIds`（`MISSING`，少算：该纳入却没有关联行）、
+  `orphanEventIds`（`ORPHAN`，多算：有关联行但按当时口径不该纳入）；
+- `contributions[]`：并集内**每个事件**一行——`eventId / eventTime / counted / category / detail`，
+  直接解释每个事件对统计的贡献；
+- `countMismatch`（统计值与去重事件数对不上）、`firingMismatch`（fired 标记与阈值不符）、
+  `alertMissing`（达到阈值却没有有效告警）、`alertNotApplicable`（未达阈值却挂着告警）；
+- 顶层 `consistent` 与 `inconsistentWindows` 汇总。告警归属还会检查：
+  关联的告警是否真包含本窗口键、是否有（甚至跨分组的）其它告警错误包含本窗口、是否多条告警重复包含。
+
+```bash
+curl 'http://localhost:8080/api/audit/windows/reconciliation?ruleCode=AUTH_BRUTE_FORCE&groupKey=mallory'
+```
+
+### 8.2 自愈 `POST /api/audit/windows/repair`
+
+请求体（全部字段可选；空体表示对全部规则做一次全量收敛）：
+
+```json
+{
+  "ruleCode": "AUTH_BRUTE_FORCE",
+  "ruleVersion": 1,
+  "groupKey": "mallory",
+  "from": "2026-09-28T13:00:00Z",
+  "to":   "2026-09-28T14:00:00Z",
+  "onlyInconsistent": true,
+  "triggerReason": "对账发现 count 与去重事件数不一致"
+}
+```
+
+可带头 `X-Operator` / `X-Operator-Role`（仅记录到审计，不做权限拦截）。
+
+**触发条件**：`onlyInconsistent` 默认 `true`，只修复对账不一致的窗口；设为 `false` 会对范围内
+每个窗口都执行一次收敛（健康窗口动作为 `NO_CHANGE`，用于排障或强制对齐）。
+
+**修复语义**（以"已受理的去重事件"为权威，不重新校验迟到，不改 `accepted_event`）：
+
+1. 按当时规则版本重算预期事件集，补齐 `MISSING` 关联（`ADDED_MEMBER`）、
+   删除 `ORPHAN` 关联（`REMOVED_ORPHAN`）；
+2. 把统计值收敛为预期去重事件数（`COUNT_CORRECTED`）；
+3. 达到阈值：确保 `fired=true` 且存在一条**仍适用**的告警——
+   优先复用已关联告警；关联错位时改挂到真正包含本窗口的告警；
+   否则按实时检测相同的 dedup 合并口径并入活跃告警，都没有才补建（`FIRE_ALERT_CREATED`，
+   流转操作人为 `system-heal`）。**已存在且仍适用的告警不会被重复创建或重复累计**；
+4. 未达阈值：撤销 `fired`；解除告警对本窗口的归属并 `occurrenceCount-1`。
+   若该告警因此不再关联任何窗口、且是未被人工处置过的纯自动告警（OPEN/SUPPRESSED、仅建警流转），
+   则删除该误报告警及其流转（`FALSE_ALERT_DELETED`，修复审计另行留痕）；
+   已被人工处置（ACK/RESOLVED 或有人工流转）的告警**不删除**，保留并标记
+   `MANUAL_REVIEW_REQUIRED` 交运维处理，避免自愈抹掉人工记录。
+
+返回 `RepairResult`：`auditId / triggerReason / operator / scannedWindows / changedWindows / actions[]`，
+每个窗口一行 `WindowRepairAction`，含修复前后 `count/fired/alertId`、动作类型、
+`addedEventIds/removedEventIds` 与文字说明。
+
+**幂等与并发**：
+
+- 可**重复触发**：第一次收敛后，后续执行对健康窗口 `NO_CHANGE`、`changedWindows=0`，
+  统计、fired、告警数量与ID保持完全一致（不会二次建警/二次累计）；
+- 可**并发触发**，也可与实时事件接入并发：自愈与接入共用同一把按窗口键的 JVM 锁，
+  且**锁覆盖整个数据库事务直到提交**，多窗口按窗口键字典序加锁防死锁；
+  锁内会重新读取并重算，因此多次（含并发）执行后结果收敛一致。审计每次触发都写一条
+  （包括幂等空跑），可用 `GET /api/audit/windows/repair/audits` 查询。
+
+> 部署说明：窗口锁是 JVM 内锁，与现有接入路径一致，适用于本项目的单实例 + H2 文件库部署；
+> `window_event` 唯一约束在多实例极端竞态下继续兜底。
+
+### 8.3 同窗口大量不同事件的并发补录/重放
+
+同一规则、同一分组、同一时间窗口允许几十条**不同**事件同时提交或从历史补入：
+事件落库与该事件命中的全部窗口更新在同一个"窗口锁 + 单事务"内完成，
+因此只要事件被成功受理，窗口最终去重事件数就与成功受理数**完全一致**（不少算、不重复算），
+阈值触发与关联告警随之正确；相同事件的并发/重试依旧只受理一次（409 `DUPLICATE_EVENT`）。
+
+### 8.4 兼容范围（升级不清库）
+
+- 只**新增**表 `repair_audit`，Hibernate `ddl-auto=update` 启动自动建表；
+  既有 `accepted_event / window_event / window_aggregate / alert / alert_window /
+  alert_transition / rejected_event / detection_rule` 表结构与数据均不变；
+- 既有 `/api/events`、规则语义、告警状态机、原有审计端点保持不变；旧库升级后直接可用，
+  无需清库或重导。对账/自愈读取的就是历史已落库数据与历史规则版本行。
+
+### 8.5 本地复现
+
+```bash
+mvn spring-boot:run
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# 阈值 3：同窗口灌入事件（可用 seq + xargs -P 并发模拟几十条补录）
+seq 1 50 | xargs -P 16 -I{} curl -s -X POST localhost:8080/api/events \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"AUTH\",\"payload\":{\"eventId\":\"bf-{}\",\"timestamp\":\"$TS\",\"username\":\"nick\",\"result\":\"LOGIN_FAIL\",\"service\":\"ssh\"}}"
+# 对账：stored/actual/expected 三个数都应为 50，consistent=true
+curl 'http://localhost:8080/api/audit/windows/reconciliation?ruleCode=AUTH_BRUTE_FORCE&groupKey=nick'
+# 自愈（此时健康窗口 changedWindows=0，空跑也写审计）
+curl -X POST localhost:8080/api/audit/windows/repair -H 'Content-Type: application/json' \
+  -H 'X-Operator: ops1' -d '{"ruleCode":"AUTH_BRUTE_FORCE","groupKey":"nick"}'
+curl localhost:8080/api/audit/windows/repair/audits
+```
+
+制造并修复不一致（演练，勿在生产直接改库）：在 H2 控制台/SQL 中删除某窗口一条
+`window_event` 行并把 `window_aggregate.count` 改成别的值 → 对账出现 `missingEventIds` 与
+`countMismatch=true` → 调 repair → 再对账 `consistent=true`，且重复 repair `changedWindows=0`。
+
+---
+
+## 9. 配置项（`src/main/resources/application.properties`）
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
