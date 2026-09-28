@@ -2,12 +2,15 @@ package com.github.h3yow.securityeventpipelinejava.service;
 
 import com.github.h3yow.securityeventpipelinejava.domain.NormalizedEvent;
 import com.github.h3yow.securityeventpipelinejava.domain.RuleMatch;
+import com.github.h3yow.securityeventpipelinejava.domain.WindowKey;
 import com.github.h3yow.securityeventpipelinejava.domain.recon.EventContribution;
 import com.github.h3yow.securityeventpipelinejava.domain.recon.RepairResult;
 import com.github.h3yow.securityeventpipelinejava.domain.recon.WindowReconciliation;
 import com.github.h3yow.securityeventpipelinejava.domain.recon.WindowReconciliationReport;
+import com.github.h3yow.securityeventpipelinejava.domain.recon.WindowRepairAction;
 import com.github.h3yow.securityeventpipelinejava.entity.AlertEntity;
 import com.github.h3yow.securityeventpipelinejava.entity.EventEntity;
+import com.github.h3yow.securityeventpipelinejava.entity.RepairAuditEntity;
 import com.github.h3yow.securityeventpipelinejava.entity.RuleEntity;
 import com.github.h3yow.securityeventpipelinejava.entity.WindowAggregateEntity;
 import com.github.h3yow.securityeventpipelinejava.entity.WindowEventEntity;
@@ -24,7 +27,9 @@ import com.github.h3yow.securityeventpipelinejava.web.WindowRepairRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -67,6 +72,7 @@ public class ReconciliationService {
     private final AlertService alertService;
     private final JsonService jsonService;
     private final WindowLockManager windowLockManager;
+    private final TransactionTemplate transactionTemplate;
 
     public ReconciliationService(RuleRepository ruleRepository,
                                  WindowAggregateRepository aggregateRepository,
@@ -78,18 +84,20 @@ public class ReconciliationService {
                                  RuleService ruleService,
                                  AlertService alertService,
                                  JsonService jsonService,
-                                 WindowLockManager windowLockManager) {
+                                 WindowLockManager windowLockManager,
+                                 PlatformTransactionManager transactionManager) {
         this.ruleRepository = ruleRepository;
         this.aggregateRepository = aggregateRepository;
         this.windowEventRepository = windowEventRepository;
         this.eventRepository = eventRepository;
+        this.ruleService = ruleService;
         this.alertRepository = alertRepository;
         this.transitionRepository = transitionRepository;
         this.repairAuditRepository = repairAuditRepository;
-        this.ruleService = ruleService;
         this.alertService = alertService;
         this.jsonService = jsonService;
         this.windowLockManager = windowLockManager;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
     // ------------------------------------------------------------------
@@ -290,12 +298,269 @@ public class ReconciliationService {
     }
 
     // ------------------------------------------------------------------
-    // 自愈（下一小步实现）
+    // 自愈
     // ------------------------------------------------------------------
 
-    @Transactional
+    /** 一次修复选中的窗口及其上下文（规则、候选事件）。 */
+    private record RepairTarget(WindowAggregateEntity agg, RuleEntity rule,
+                                List<EventEntity> candidates, WindowModel model) {
+    }
+
+    /** 单个窗口在某个时刻的对账计算中间态（对账查询与自愈共用）。 */
+    private record WindowModel(
+            String windowKey,
+            Set<String> actualIds,
+            Set<String> expectedIds,
+            Set<String> missing,
+            Set<String> orphan,
+            boolean shouldFire,
+            List<EventEntity> windowEvents) {
+        boolean consistent(long storedCount, boolean fired, Long alertId) {
+            return missing.isEmpty() && orphan.isEmpty()
+                    && storedCount == expectedIds.size()
+                    && actualIds.size() == expectedIds.size()
+                    && fired == shouldFire
+                    && (shouldFire ? alertId != null : alertId == null);
+        }
+    }
+
     public RepairResult repair(WindowRepairRequest request, String operator, String operatorRole) {
-        // 骨架占位，下一步填充
-        return null;
+        WindowRepairRequest req = request == null
+                ? new WindowRepairRequest(null, null, null, null, null, null, null) : request;
+        String reason = req.triggerReason() == null || req.triggerReason().isBlank()
+                ? "运维发起窗口自愈" : req.triggerReason();
+        boolean onlyInconsistent = req.onlyInconsistent() == null || req.onlyInconsistent();
+
+        Instant fromInstant = parseBoundary(req.from(), "from");
+        Instant toInstant = parseBoundary(req.to(), "to");
+
+        // 选择规则版本：未指定 ruleCode 时覆盖全部规则（用于全局收敛）
+        List<RuleEntity> versions = req.ruleCode() == null || req.ruleCode().isBlank()
+                ? ruleRepository.findAll()
+                : resolveRuleVersions(req.ruleCode(), req.ruleVersion());
+        Set<Long> ruleIds = versions.stream().map(RuleEntity::getId).collect(Collectors.toSet());
+        long maxWindowSeconds = versions.stream().mapToLong(RuleEntity::getWindowSeconds).max().orElse(0L);
+        Instant scanFrom = fromInstant == null ? null : fromInstant.minusSeconds(maxWindowSeconds);
+        List<EventEntity> events = scanEvents(scanFrom, toInstant);
+
+        Map<Long, RuleEntity> ruleById = versions.stream()
+                .collect(Collectors.toMap(RuleEntity::getId, r -> r));
+
+        // 先在事务外（只读短事务）选出目标窗口，拿到稳定的窗口键集合用于加锁
+        List<RepairTarget> targets = selectTargets(
+                ruleById, ruleIds, req.groupKey(), fromInstant, toInstant, onlyInconsistent, events);
+        List<String> windowKeys = targets.stream()
+                .map(t -> t.model().windowKey).sorted().distinct().toList();
+
+        log.info("窗口自愈开始: operator={}, 范围 ruleCode={}, version={}, group={}, [{},{}), 目标窗口数={}",
+                operator, req.ruleCode(), req.ruleVersion(), req.groupKey(),
+                req.from(), req.to(), targets.size());
+
+        // 覆盖事务全程的窗口锁（与接入路径相同的锁），内部单事务收敛并写审计
+        List<WindowRepairAction> actions = new ArrayList<>();
+        long[] auditIdHolder = new long[1];
+        int[] changedHolder = new int[1];
+        windowLockManager.runLocked(windowKeys, () -> transactionTemplate.executeWithoutResult(status -> {
+            // 锁内重新读取聚合并重算，避免选窗后发生漂移
+            for (RepairTarget t : targets) {
+                WindowAggregateEntity agg = aggregateRepository.findById(t.agg().getId()).orElse(null);
+                if (agg == null) {
+                    continue;
+                }
+                WindowModel model = computeModel(agg, t.rule(), t.candidates());
+                // onlyInconsistent 在锁内再次判定，保证与最新状态一致
+                if (onlyInconsistent && model.consistent(
+                        agg.getCount(), agg.isFired(), agg.getMatchedAlertId())) {
+                    actions.add(noChange(t.rule(), agg, "窗口一致，无需修复"));
+                    continue;
+                }
+                actions.add(repairWindow(agg, t.rule(), model));
+            }
+            changedHolder[0] = (int) actions.stream().filter(WindowRepairAction::changed).count();
+
+            RepairAuditEntity audit = new RepairAuditEntity();
+            audit.setTriggerReason(reason);
+            audit.setOperator(operator);
+            audit.setOperatorRole(operatorRole);
+            audit.setScopeJson(jsonService.write(Map.of(
+                    "ruleCode", req.ruleCode() == null ? "*" : req.ruleCode(),
+                    "ruleVersion", req.ruleVersion() == null ? "*" : req.ruleVersion(),
+                    "groupKey", req.groupKey() == null ? "*" : req.groupKey(),
+                    "from", req.from() == null ? "*" : req.from(),
+                    "to", req.to() == null ? "*" : req.to(),
+                    "onlyInconsistent", onlyInconsistent)));
+            audit.setScannedWindows(targets.size());
+            audit.setChangedWindows(changedHolder[0]);
+            audit.setActionsJson(jsonService.write(actions));
+            audit.setCreatedAt(Instant.now());
+            RepairAuditEntity saved = repairAuditRepository.save(audit);
+            auditIdHolder[0] = saved.getId();
+        }));
+
+        log.info("窗口自愈完成: auditId={}, 扫描={}, 变更={}", auditIdHolder[0], targets.size(), changedHolder[0]);
+        return new RepairResult(auditIdHolder[0], reason, operator,
+                targets.size(), changedHolder[0], List.copyOf(actions));
+    }
+
+    private List<RepairTarget> selectTargets(Map<Long, RuleEntity> ruleById, Set<Long> ruleIds,
+                                             String groupKey, Instant from, Instant to,
+                                             boolean onlyInconsistent, List<EventEntity> events) {
+        return transactionTemplate.execute(status -> aggregateRepository.findAll().stream()
+                .filter(a -> ruleIds.contains(a.getRuleId()))
+                .filter(a -> groupKey == null || groupKey.equals(a.getGroupKey()))
+                .filter(a -> from == null || a.getWindowStart() >= from.getEpochSecond())
+                .filter(a -> to == null || a.getWindowStart() < to.getEpochSecond())
+                .sorted(Comparator.comparingLong(WindowAggregateEntity::getRuleId)
+                        .thenComparingInt(WindowAggregateEntity::getVersion)
+                        .thenComparing(WindowAggregateEntity::getGroupKey)
+                        .thenComparingLong(WindowAggregateEntity::getWindowStart))
+                .map(a -> new RepairTarget(a, ruleById.get(a.getRuleId()), events,
+                        computeModel(a, ruleById.get(a.getRuleId()), events)))
+                .filter(t -> !onlyInconsistent || !t.model().consistent(
+                        t.agg().getCount(), t.agg().isFired(), t.agg().getMatchedAlertId()))
+                .toList());
+    }
+
+    /** 计算窗口实际/预期集合与差异（不写库）。 */
+    private WindowModel computeModel(WindowAggregateEntity agg, RuleEntity rule,
+                                     List<EventEntity> candidates) {
+        String windowKey = encodeWindowKey(agg);
+        List<WindowEventEntity> rows =
+                windowEventRepository.findByRuleIdAndWindowKeyOrderByEventIdAsc(agg.getRuleId(), windowKey);
+        TreeSet<String> actualIds = rows.stream().map(WindowEventEntity::getEventId)
+                .collect(Collectors.toCollection(TreeSet::new));
+        Set<String> expectedIds = expectedEventIds(rule, agg, candidates);
+        List<EventEntity> windowEvents = candidates.stream()
+                .filter(e -> expectedIds.contains(e.getEventId()))
+                .sorted(Comparator.comparing(EventEntity::getEventTime).thenComparing(EventEntity::getEventId))
+                .toList();
+        TreeSet<String> missing = new TreeSet<>(expectedIds);
+        missing.removeAll(actualIds);
+        TreeSet<String> orphan = new TreeSet<>(actualIds);
+        orphan.removeAll(expectedIds);
+        boolean shouldFire = expectedIds.size() >= rule.getThreshold();
+        return new WindowModel(windowKey, actualIds, expectedIds, missing, orphan, shouldFire, windowEvents);
+    }
+
+    /** 在调用方事务与窗口锁内，收敛单个窗口到权威状态。 */
+    private WindowRepairAction repairWindow(WindowAggregateEntity agg, RuleEntity rule, WindowModel m) {
+        long countBefore = agg.getCount();
+        boolean firedBefore = agg.isFired();
+        Long alertBefore = agg.getMatchedAlertId();
+        List<String> actionTypes = new ArrayList<>();
+        List<String> added = new ArrayList<>();
+        List<String> removed = new ArrayList<>();
+        List<String> notes = new ArrayList<>();
+
+        // 1) 补齐缺失关联（少算）
+        for (String eventId : m.missing()) {
+            windowEventRepository.saveAndFlush(
+                    new WindowEventEntity(rule.getId(), m.windowKey(), eventId));
+            added.add(eventId);
+        }
+        if (!m.missing().isEmpty()) {
+            actionTypes.add("ADDED_MEMBER");
+            notes.add("补录缺失事件 " + m.missing());
+        }
+        // 2) 删除孤儿关联（多算）
+        for (String eventId : m.orphan()) {
+            windowEventRepository.deleteByRuleIdAndWindowKeyAndEventId(
+                    rule.getId(), m.windowKey(), eventId);
+            removed.add(eventId);
+        }
+        if (!m.orphan().isEmpty()) {
+            actionTypes.add("REMOVED_ORPHAN");
+            notes.add("移除不应纳入的关联 " + m.orphan());
+        }
+
+        // 3) 收敛统计值到权威去重事件数
+        long correctCount = m.expectedIds().size();
+        if (agg.getCount() != correctCount) {
+            actionTypes.add("COUNT_CORRECTED");
+            notes.add("统计值 " + agg.getCount() + " -> " + correctCount);
+            agg.setCount(correctCount);
+        }
+
+        WindowKey windowKey = new WindowKey(rule.getId(), rule.getVersion(),
+                agg.getGroupKey(), agg.getWindowStart());
+        Long alertAfter = alertBefore;
+
+        // 4) 阈值/告警收敛
+        if (m.shouldFire()) {
+            agg.setFired(true);
+            if (firedBefore != agg.isFired()) {
+                actionTypes.add("FIRED_CORRECTED");
+            }
+            if (alertBefore == null) {
+                Instant reference = m.windowEvents().isEmpty()
+                        ? Instant.ofEpochSecond(agg.getWindowStart())
+                        : m.windowEvents().get(m.windowEvents().size() - 1).getEventTime();
+                alertAfter = alertService.ensureAlertForWindow(rule, windowKey, agg, reference);
+                actionTypes.add("FIRE_ALERT_CREATED");
+                notes.add("达到阈值但缺告警，补建/关联告警 " + alertAfter);
+            } else {
+                // 已有关联：校验其仍包含本窗口，不包含则改挂回正确告警，绝不重复建警/累计
+                alertAfter = alertService.ensureAlertForWindow(
+                        rule, windowKey, agg,
+                        m.windowEvents().isEmpty() ? Instant.ofEpochSecond(agg.getWindowStart())
+                                : m.windowEvents().get(m.windowEvents().size() - 1).getEventTime());
+                if (!alertAfter.equals(alertBefore)) {
+                    actionTypes.add("ALERT_RELINKED");
+                    notes.add("告警关联错位，改挂告警 " + alertBefore + " -> " + alertAfter);
+                }
+            }
+        } else {
+            if (agg.isFired()) {
+                agg.setFired(false);
+                actionTypes.add("FIRED_CORRECTED");
+                notes.add("实际未达阈值，撤销触发标记");
+            }
+            if (alertBefore != null
+                    || !m.actualIds().isEmpty() && anyAlertContainsWindow(m.windowKey())) {
+                AlertService.AlertClearResult clear =
+                        alertService.clearAlertForWindow(windowKey, alertBefore);
+                alertAfter = clear.deleted() ? null : clear.alertId();
+                if (clear.deleted()) {
+                    actionTypes.add("FALSE_ALERT_DELETED");
+                } else {
+                    actionTypes.add("FALSE_ALERT_CLEARED");
+                }
+                if (clear.needsManualReview()) {
+                    actionTypes.add("MANUAL_REVIEW_REQUIRED");
+                }
+                notes.add(clear.note());
+                agg.setMatchedAlertId(clear.deleted() ? null : clear.alertId());
+                alertAfter = agg.getMatchedAlertId();
+            }
+        }
+
+        boolean changed = !actionTypes.isEmpty();
+        if (!changed) {
+            actionTypes.add("NO_CHANGE");
+        }
+        aggregateRepository.save(agg);
+
+        WindowRepairAction action = new WindowRepairAction(
+                m.windowKey(), rule.getRuleCode(), rule.getVersion(), agg.getGroupKey(),
+                agg.getWindowStart(), changed, countBefore, correctCount,
+                firedBefore, agg.isFired(), alertBefore, alertAfter,
+                actionTypes, List.copyOf(added), List.copyOf(removed),
+                String.join("；", notes));
+        log.info("[自愈明细] window={}, actions={}, count {}->{}, fired {}->{}, alert {}->{}",
+                m.windowKey(), actionTypes, countBefore, correctCount,
+                firedBefore, agg.isFired(), alertBefore, alertAfter);
+        return action;
+    }
+
+    private boolean anyAlertContainsWindow(String windowKey) {
+        return alertRepository.findAll().stream().anyMatch(a -> a.getWindowKeys().contains(windowKey));
+    }
+
+    private WindowRepairAction noChange(RuleEntity rule, WindowAggregateEntity agg, String note) {
+        return new WindowRepairAction(
+                encodeWindowKey(agg), rule.getRuleCode(), rule.getVersion(), agg.getGroupKey(),
+                agg.getWindowStart(), false, agg.getCount(), agg.getCount(),
+                agg.isFired(), agg.isFired(), agg.getMatchedAlertId(), agg.getMatchedAlertId(),
+                List.of("NO_CHANGE"), List.of(), List.of(), note);
     }
 }
