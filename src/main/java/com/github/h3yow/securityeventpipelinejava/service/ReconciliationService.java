@@ -164,16 +164,28 @@ public class ReconciliationService {
         orphan.removeAll(expectedIds);
 
         boolean shouldFire = expectedIds.size() >= rule.getThreshold();
-        boolean alertMissing = shouldFire && agg.getMatchedAlertId() == null;
-        boolean alertNotApplicable = !shouldFire && agg.getMatchedAlertId() != null;
+        // 告警归属健康度：恰好"该有一条且关联正确"才算健康
+        List<Long> containingAlerts = alertRepository.findAll().stream()
+                .filter(a -> a.getRuleId() == rule.getId())
+                .filter(a -> a.getWindowKeys().contains(windowKey))
+                .map(AlertEntity::getId).sorted().toList();
+        boolean linkedContains = agg.getMatchedAlertId() != null
+                && containingAlerts.contains(agg.getMatchedAlertId());
+        boolean alertMissing = shouldFire
+                && (agg.getMatchedAlertId() == null || !linkedContains);
+        boolean alertNotApplicable = !shouldFire && !containingAlerts.isEmpty();
 
         List<EventContribution> contributions = buildContributions(
                 actualRows, actualIds, expectedIds, candidates);
 
         boolean countMismatch = agg.getCount() != actualIds.size() || agg.getCount() != expectedIds.size();
         boolean firingMismatch = agg.isFired() != shouldFire;
+        // 多条告警同时包含同一窗口，或关联指向的告警不含本窗口，均属归属错位
+        boolean alertLinkBroken = shouldFire
+                ? (!linkedContains || containingAlerts.size() > 1)
+                : !containingAlerts.isEmpty();
         boolean consistent = missing.isEmpty() && orphan.isEmpty()
-                && !countMismatch && !firingMismatch && !alertMissing && !alertNotApplicable;
+                && !countMismatch && !firingMismatch && !alertLinkBroken;
 
         return new WindowReconciliation(
                 rule.getId(), rule.getRuleCode(), rule.getVersion(), agg.getGroupKey(),
@@ -314,13 +326,18 @@ public class ReconciliationService {
             Set<String> missing,
             Set<String> orphan,
             boolean shouldFire,
+            List<Long> containingAlertIds,
             List<EventEntity> windowEvents) {
         boolean consistent(long storedCount, boolean fired, Long alertId) {
+            boolean linkedContains = alertId != null && containingAlertIds.contains(alertId);
+            boolean alertLinkBroken = shouldFire
+                    ? (!linkedContains || containingAlertIds.size() > 1)
+                    : !containingAlertIds.isEmpty();
             return missing.isEmpty() && orphan.isEmpty()
                     && storedCount == expectedIds.size()
                     && actualIds.size() == expectedIds.size()
                     && fired == shouldFire
-                    && (shouldFire ? alertId != null : alertId == null);
+                    && !alertLinkBroken;
         }
     }
 
@@ -439,7 +456,12 @@ public class ReconciliationService {
         TreeSet<String> orphan = new TreeSet<>(actualIds);
         orphan.removeAll(expectedIds);
         boolean shouldFire = expectedIds.size() >= rule.getThreshold();
-        return new WindowModel(windowKey, actualIds, expectedIds, missing, orphan, shouldFire, windowEvents);
+        List<Long> containingAlerts = alertRepository.findAll().stream()
+                .filter(a -> a.getRuleId() == rule.getId())
+                .filter(a -> a.getWindowKeys().contains(windowKey))
+                .map(AlertEntity::getId).sorted().toList();
+        return new WindowModel(windowKey, actualIds, expectedIds, missing, orphan,
+                shouldFire, containingAlerts, windowEvents);
     }
 
     /** 在调用方事务与窗口锁内，收敛单个窗口到权威状态。 */
@@ -515,11 +537,10 @@ public class ReconciliationService {
                 actionTypes.add("FIRED_CORRECTED");
                 notes.add("实际未达阈值，撤销触发标记");
             }
-            if (alertBefore != null
-                    || !m.actualIds().isEmpty() && anyAlertContainsWindow(m.windowKey())) {
-                AlertService.AlertClearResult clear =
-                        alertService.clearAlertForWindow(windowKey, alertBefore);
-                alertAfter = clear.deleted() ? null : clear.alertId();
+            // 无论 matchedAlertId 是否为空，都检查是否有告警错误包含本窗口并解除
+            AlertService.AlertClearResult clear =
+                    alertService.clearAlertForWindow(windowKey, alertBefore);
+            if (clear.alertId() != null || clear.deleted()) {
                 if (clear.deleted()) {
                     actionTypes.add("FALSE_ALERT_DELETED");
                 } else {
@@ -529,9 +550,9 @@ public class ReconciliationService {
                     actionTypes.add("MANUAL_REVIEW_REQUIRED");
                 }
                 notes.add(clear.note());
-                agg.setMatchedAlertId(clear.deleted() ? null : clear.alertId());
-                alertAfter = agg.getMatchedAlertId();
             }
+            agg.setMatchedAlertId(clear.deleted() ? null : clear.alertId());
+            alertAfter = agg.getMatchedAlertId();
         }
 
         boolean changed = !actionTypes.isEmpty();
@@ -550,10 +571,6 @@ public class ReconciliationService {
                 m.windowKey(), actionTypes, countBefore, correctCount,
                 firedBefore, agg.isFired(), alertBefore, alertAfter);
         return action;
-    }
-
-    private boolean anyAlertContainsWindow(String windowKey) {
-        return alertRepository.findAll().stream().anyMatch(a -> a.getWindowKeys().contains(windowKey));
     }
 
     private WindowRepairAction noChange(RuleEntity rule, WindowAggregateEntity agg, String note) {

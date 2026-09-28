@@ -171,10 +171,9 @@ public class AlertService {
                 return linked.getId();
             }
         }
-        // 2) 其它告警已包含该窗口（关联错位的修复：改挂回去，绝不新建）
+        // 2) 其它告警已包含该窗口（关联错位的修复：改挂回去，绝不新建；窗口键已含分组，不再限组）
         AlertEntity owner = alertRepository.findAll().stream()
                 .filter(a -> a.getRuleId() == rule.getId())
-                .filter(a -> a.getGroupKey().equals(windowKey.groupKey()))
                 .filter(a -> a.getWindowKeys().contains(windowKeyEncoded))
                 .min(Comparator.comparingLong(AlertEntity::getId))
                 .orElse(null);

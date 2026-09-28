@@ -243,4 +243,46 @@ class WindowSelfHealTest {
                 .reconcile("AUTH_BRUTE_FORCE", null, "sam", null, null).windows().get(0);
         assertTrue(r.consistent());
     }
+
+    @Test
+    void orphanWindowMembershipInMergedAlertIsDetectedAndCleared() {
+        Instant ts = Instant.now().truncatedTo(ChronoUnit.MINUTES).plusSeconds(10);
+        // tina 窗口只有 2 条（未达阈值）
+        for (int i = 1; i <= 2; i++) {
+            ingestionService.ingest(auth("he-4-" + i, ts.plusSeconds(i), "tina"));
+        }
+        WindowAggregateEntity tina = windowOf("tina");
+        String tinaKey = tina.getRuleId() + "#v" + tina.getVersion() + "#tina#" + tina.getWindowStart();
+        // 另一个真实命中的窗口 uma（3 条），产生一条合并告警
+        for (int i = 1; i <= 3; i++) {
+            ingestionService.ingest(auth("he-4-uma-" + i, ts.plusSeconds(i), "uma"));
+        }
+        AlertEntity umaAlert = alertRepository.findAll().stream()
+                .filter(a -> a.getGroupKey().equals("uma")).findFirst().orElseThrow();
+        // 漂移：tina 未达阈值，却被错误塞进了 uma 的告警（注意不是 tina 自己的关联）
+        umaAlert.getWindowKeys().add(tinaKey);
+        umaAlert.setOccurrenceCount(umaAlert.getOccurrenceCount() + 1);
+        alertRepository.saveAndFlush(umaAlert);
+        log.info("[输入差异] tina 窗口仅 2 事件未达阈值，但被错误并入告警 {} (occurrenceCount={})",
+                umaAlert.getId(), umaAlert.getOccurrenceCount());
+
+        WindowReconciliation before = reconciliationService
+                .reconcile("AUTH_BRUTE_FORCE", null, "tina", null, null).windows().get(0);
+        log.info("[判定依据] 修复前 consistent={}, alertNotApplicable={}, shouldFire={}",
+                before.consistent(), before.alertNotApplicable(), before.shouldFire());
+        assertEquals(false, before.consistent());
+        assertTrue(before.alertNotApplicable());
+
+        reconciliationService.repair(repairFor("tina"), "ops-4", "ADMIN");
+
+        AlertEntity afterAlert = alertRepository.findById(umaAlert.getId()).orElseThrow();
+        log.info("[最终状态] 修复后告警 {} 仍存在={}, 仍含 tina 窗口={}, occurrenceCount={}",
+                umaAlert.getId(), true, afterAlert.getWindowKeys().contains(tinaKey),
+                afterAlert.getOccurrenceCount());
+        assertEquals(false, afterAlert.getWindowKeys().contains(tinaKey), "错误归属必须解除");
+        assertEquals(1, afterAlert.getOccurrenceCount(), "合并次数必须回退为 1");
+        WindowReconciliation after = reconciliationService
+                .reconcile("AUTH_BRUTE_FORCE", null, "tina", null, null).windows().get(0);
+        assertTrue(after.consistent(), "修复后 tina 窗口一致，且未误删 uma 的真实告警");
+    }
 }
