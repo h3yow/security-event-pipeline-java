@@ -365,7 +365,7 @@ public class ReconciliationService {
 
         // 先在事务外（只读短事务）选出目标窗口，拿到稳定的窗口键集合用于加锁
         List<RepairTarget> targets = selectTargets(
-                ruleById, ruleIds, req.groupKey(), fromInstant, toInstant, onlyInconsistent, events);
+                ruleById, ruleIds, req.groupKey(), fromInstant, toInstant, events);
         List<String> windowKeys = targets.stream()
                 .map(t -> t.model().windowKey).sorted().distinct().toList();
 
@@ -421,7 +421,8 @@ public class ReconciliationService {
 
     private List<RepairTarget> selectTargets(Map<Long, RuleEntity> ruleById, Set<Long> ruleIds,
                                              String groupKey, Instant from, Instant to,
-                                             boolean onlyInconsistent, List<EventEntity> events) {
+                                             List<EventEntity> events) {
+        // 选中范围内全部窗口；是否一致在锁内用最新状态判定，保证 scannedWindows 反映真实扫描范围
         return transactionTemplate.execute(status -> aggregateRepository.findAll().stream()
                 .filter(a -> ruleIds.contains(a.getRuleId()))
                 .filter(a -> groupKey == null || groupKey.equals(a.getGroupKey()))
@@ -433,8 +434,6 @@ public class ReconciliationService {
                         .thenComparingLong(WindowAggregateEntity::getWindowStart))
                 .map(a -> new RepairTarget(a, ruleById.get(a.getRuleId()), events,
                         computeModel(a, ruleById.get(a.getRuleId()), events)))
-                .filter(t -> !onlyInconsistent || !t.model().consistent(
-                        t.agg().getCount(), t.agg().isFired(), t.agg().getMatchedAlertId()))
                 .toList());
     }
 
