@@ -11,4 +11,6 @@ public interface WindowAggregateRepository extends JpaRepository<WindowAggregate
             long ruleId, int version, String groupKey, long windowStart);
 
     List<WindowAggregateEntity> findAllByOrderByIdDesc();
+
+    List<WindowAggregateEntity> findByMatchedAlertId(Long matchedAlertId);
 }

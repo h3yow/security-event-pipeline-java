@@ -66,18 +66,22 @@ public class RuleService {
         entity.setAction(req.action());
         entity.setDedupSeconds(req.dedupSeconds());
         entity.setEnabled(req.enabled() == null || req.enabled());
-        entity.setCreatedAt(Instant.now());
 
         int nextVersion = ruleRepository.findByRuleCodeOrderByVersionDesc(req.ruleCode())
                 .stream().findFirst().map(r -> r.getVersion() + 1).orElse(1);
         entity.setVersion(nextVersion);
+        Instant now = Instant.now();
+        entity.setCreatedAt(now);
         RuleEntity saved = ruleRepository.save(entity);
 
-        // 旧版本标记为停用（行仍保留，供历史追溯）
+        // 旧版本标记为停用（行仍保留，供历史追溯），并记录其停止生效时刻 = 新版本创建时刻
         ruleRepository.findByRuleCodeOrderByVersionDesc(req.ruleCode()).stream()
                 .filter(r -> r.getVersion() != nextVersion)
                 .forEach(r -> {
                     r.setEnabled(false);
+                    if (r.getSupersededAt() == null) {
+                        r.setSupersededAt(now);
+                    }
                     ruleRepository.save(r);
                 });
         return saved;

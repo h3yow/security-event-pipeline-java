@@ -10,6 +10,7 @@ import com.github.h3yow.securityeventpipelinejava.entity.AlertEntity;
 import com.github.h3yow.securityeventpipelinejava.entity.AlertTransitionEntity;
 import com.github.h3yow.securityeventpipelinejava.entity.RuleEntity;
 import com.github.h3yow.securityeventpipelinejava.entity.WindowAggregateEntity;
+import com.github.h3yow.securityeventpipelinejava.domain.healing.AlertReconcileResult;
 import com.github.h3yow.securityeventpipelinejava.exception.AccessDeniedException;
 import com.github.h3yow.securityeventpipelinejava.exception.AlertStateException;
 import com.github.h3yow.securityeventpipelinejava.exception.ResourceNotFoundException;
@@ -255,5 +256,93 @@ public class AlertService {
         t.setNote(note);
         t.setCreatedAt(Instant.now());
         transitionRepository.save(t);
+    }
+
+    /**
+     * 窗口自愈时收敛告警关联，调用方须已持有该窗口锁（本方法不再加窗口锁）。
+     *
+     * <p>三种动作，幂等：
+     * <ul>
+     *   <li>{@code ATTACH_EXISTING}：窗口应触发且已有<b>活跃</b>告警携带该窗口键，
+     *       不重复创建、不重复累计 occurrenceCount（RESOLVED 为终态，不算“仍适用”）；</li>
+     *   <li>{@code CREATE}：窗口应触发但没有任何活跃告警支撑，按规则动作新建初始告警；</li>
+     *   <li>{@code DETACH_RESOLVE}：窗口未达阈值却挂在告警上（误报）：从告警窗口列表移除；
+     *       该告警再无其他窗口支撑时自动 RESOLVED 并写状态流转审计，仍支撑其他窗口则仅摘除、保留。</li>
+     * </ul>
+     * 仅在告警状态真正变化时写 alert_transition；窗口关联的增删统一记入自愈审计表。
+     *
+     * @return 收敛结果（告警ID + CREATE/ATTACH_EXISTING/DETACH_RESOLVE/NONE）
+     */
+    @Transactional
+    public AlertReconcileResult reconcileForHealing(RuleEntity rule, WindowKey windowKey, long correctCount) {
+        String encoded = windowKey.encode();
+        List<AlertEntity> carrying = alertRepository.findByWindowKey(encoded);
+
+        boolean shouldFire = correctCount >= rule.getThreshold();
+        if (shouldFire) {
+            // 仅活跃告警算“仍适用”；RESOLVED 是终态，应仿照实时语义另建新警
+            AlertEntity active = carrying.stream()
+                    .filter(a -> ACTIVE.contains(a.getStatus()))
+                    .findFirst().orElse(null);
+            if (active != null) {
+                log.info("自愈: 窗口 {} 活跃告警已存在且仍适用，不重复创建/累计, alertId={}, status={}",
+                        encoded, active.getId(), active.getStatus());
+                return new AlertReconcileResult(active.getId(), "ATTACH_EXISTING");
+            }
+            // 应触发但无活跃告警：按规则动作新建（不改变任何既有告警的 occurrenceCount）
+            AlertEntity alert = new AlertEntity();
+            alert.setRuleId(rule.getId());
+            alert.setRuleVersion(rule.getVersion());
+            alert.setRuleCode(rule.getRuleCode());
+            alert.setRuleSnapshotJson(jsonService.write(ruleSnapshot(rule)));
+            alert.setGroupKey(windowKey.groupKey());
+            AlertStatus initial = rule.getAction().equals(RuleAction.SUPPRESS.name())
+                    ? AlertStatus.SUPPRESSED : AlertStatus.OPEN;
+            alert.setStatus(initial.name());
+            alert.setOccurrenceCount(1);
+            alert.getWindowKeys().add(encoded);
+            // 自愈场景没有单一触发事件：以窗口起点为事件时间
+            Instant windowTime = Instant.ofEpochSecond(windowKey.windowStart());
+            alert.setFirstEventTime(windowTime);
+            alert.setLastEventTime(windowTime);
+            Instant now = Instant.now();
+            alert.setCreatedAt(now);
+            alert.setUpdatedAt(now);
+            AlertEntity saved = alertRepository.save(alert);
+            recordTransition(saved.getId(), null, initial, "system", "HEALING",
+                    "窗口自愈：按已受理去重事件复算 count=" + correctCount
+                            + " 达阈值 " + rule.getThreshold() + "，补建告警");
+            log.info("自愈: 窗口 {} 应触发但缺活跃告警，补建 alertId={}, initialStatus={}",
+                    encoded, saved.getId(), initial);
+            return new AlertReconcileResult(saved.getId(), "CREATE");
+        }
+
+        // 未达阈值：从携带该窗口键的告警上摘除；失去全部支撑窗口的活跃告警自动 RESOLVED（不误报）
+        if (carrying.isEmpty()) {
+            return new AlertReconcileResult(-1L, "NONE");
+        }
+        for (AlertEntity a : carrying) {
+            if (!a.getWindowKeys().remove(encoded)) {
+                continue;
+            }
+            a.setUpdatedAt(Instant.now());
+            if (!a.getWindowKeys().isEmpty() || !ACTIVE.contains(a.getStatus())) {
+                // 仍有其他窗口支撑，或本就是终态：仅摘除关联，状态不变（不写状态流转）
+                alertRepository.save(a);
+                log.info("自愈: 窗口 {} 未达阈值，从告警 {} 摘除关联（状态保持 {}，剩余支撑窗口 {} 个）",
+                        encoded, a.getId(), a.getStatus(), a.getWindowKeys().size());
+            } else {
+                AlertStatus from = AlertStatus.valueOf(a.getStatus());
+                a.setStatus(AlertStatus.RESOLVED.name());
+                a.setResolvedAt(Instant.now());
+                a.setResolvedBy("system(HEALING)");
+                alertRepository.save(a);
+                recordTransition(a.getId(), from, AlertStatus.RESOLVED, "system", "HEALING",
+                        "窗口自愈：窗口 " + encoded + " 复算 count=" + correctCount
+                                + " 未达阈值 " + rule.getThreshold() + "，且无其他支撑窗口，自动解除告警");
+                log.info("自愈: 误报告警 {} 失去全部支撑窗口，{} -> RESOLVED", a.getId(), from);
+            }
+        }
+        return new AlertReconcileResult(-1L, "DETACH_RESOLVE");
     }
 }

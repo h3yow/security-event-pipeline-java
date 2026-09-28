@@ -10,5 +10,6 @@ public interface RuleRepository extends JpaRepository<RuleEntity, Long> {
     List<RuleEntity> findByEnabledTrue();
     Optional<RuleEntity> findByRuleCodeAndEnabledTrue(String ruleCode);
     List<RuleEntity> findByRuleCodeOrderByVersionDesc(String ruleCode);
+    Optional<RuleEntity> findByRuleCodeAndVersion(String ruleCode, int version);
     boolean existsByRuleCodeAndVersion(String ruleCode, int version);
 }

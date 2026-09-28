@@ -2,6 +2,7 @@ package com.github.h3yow.securityeventpipelinejava.service;
 
 import com.github.h3yow.securityeventpipelinejava.domain.IngestResult;
 import com.github.h3yow.securityeventpipelinejava.domain.NormalizedEvent;
+import com.github.h3yow.securityeventpipelinejava.domain.WindowTarget;
 import com.github.h3yow.securityeventpipelinejava.entity.EventEntity;
 import com.github.h3yow.securityeventpipelinejava.entity.RejectedEventEntity;
 import com.github.h3yow.securityeventpipelinejava.exception.DuplicateEventException;
@@ -42,17 +43,20 @@ public class IngestionService {
     private final EventRepository eventRepository;
     private final RejectedEventRepository rejectedEventRepository;
     private final DetectionService detectionService;
+    private final WindowLockManager windowLockManager;
     private final JsonService jsonService;
 
     public IngestionService(Normalizer normalizer,
                             EventRepository eventRepository,
                             RejectedEventRepository rejectedEventRepository,
                             DetectionService detectionService,
+                            WindowLockManager windowLockManager,
                             JsonService jsonService) {
         this.normalizer = normalizer;
         this.eventRepository = eventRepository;
         this.rejectedEventRepository = rejectedEventRepository;
         this.detectionService = detectionService;
+        this.windowLockManager = windowLockManager;
         this.jsonService = jsonService;
     }
 
@@ -81,31 +85,53 @@ public class IngestionService {
         }
 
         String eventId = event.eventId();
-        Lock lock = lockFor(eventId);
-        lock.lock();
+        Lock eventLock = lockFor(eventId);
+        eventLock.lock();
         try {
             if (eventRepository.existsByEventId(eventId)) {
                 log.warn("重复提交被拒绝: eventId={}", eventId);
                 throw new DuplicateEventException(eventId);
             }
-            List<Long> alertIds;
+
+            // 纯计算：匹配规则、对齐窗口、迟到判定（不持数据库连接/事务）
+            List<WindowTarget> targets;
             try {
-                // 单一事务：事件落库 + 窗口计数 + 建警；检测阶段异常整体回滚
-                alertIds = detectionService.processEvent(event);
-            } catch (DuplicateEventException dup) {
-                // 极端并发下由 event_id 唯一约束兜底：重新抛出，由全局处理器归类为 409
-                throw dup;
+                targets = detectionService.resolveTargets(event);
             } catch (ValidationException lateReject) {
-                // 窗口已过期等检测期拒绝：独立事务留痕，事件不落库，但拒绝不静默
+                // 窗口已过期：独立事务留痕，事件不落库，但拒绝不静默
                 recordRejection(eventId, event.source().name(),
                         lateReject.getReason().name(), lateReject.getMessage(), rawJson);
                 return IngestResult.rejected(eventId,
                         lateReject.getReason().name(), lateReject.getMessage());
             }
-            log.info("事件处理完成: eventId={}, 触发/关联告警IDs={}", eventId, alertIds);
-            return IngestResult.ok(eventId, alertIds);
+
+            // 事务外按窗口键排序获取全部窗口锁：同窗口并发读-改-写串行化，且杜绝多窗口死锁。
+            // 与事件级锁配合：相同事件重试仍串行、只算一次；不同事件对同窗口排队、各自计一次。
+            List<Lock> heldLocks = new java.util.ArrayList<>(targets.size());
+            try {
+                for (WindowTarget t : targets) {
+                    Lock l = windowLockManager.lockFor(t.key().encode());
+                    l.lock();
+                    heldLocks.add(l);
+                }
+                List<Long> alertIds;
+                try {
+                    // 单一事务：事件落库 + 窗口计数 + 建警；任一步异常整体回滚
+                    alertIds = detectionService.processEvent(event, targets);
+                } catch (DuplicateEventException dup) {
+                    // 极端并发下由 event_id 唯一约束兜底：重新抛出，由全局处理器归类为 409
+                    throw dup;
+                }
+                log.info("事件处理完成: eventId={}, 触发/关联告警IDs={}", eventId, alertIds);
+                return IngestResult.ok(eventId, alertIds);
+            } finally {
+                // 逆序释放
+                for (int i = heldLocks.size() - 1; i >= 0; i--) {
+                    heldLocks.get(i).unlock();
+                }
+            }
         } finally {
-            lock.unlock();
+            eventLock.unlock();
         }
     }
 

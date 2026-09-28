@@ -64,6 +64,14 @@ public class RuleEntity {
     @Column(nullable = false)
     private boolean enabled = true;
 
+    /**
+     * 该版本停止生效的时刻：被下一版本取代时写入下一版本的 createdAt；
+     * 当前生效版本为 null。对账/自愈据此界定“事件受理时命中的是不是这个版本”，
+     * 避免升级后受理的事件被错误地复算进旧版本窗口。
+     */
+    @Column(name = "superseded_at")
+    private Instant supersededAt;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 
@@ -93,4 +101,6 @@ public class RuleEntity {
     public void setEnabled(boolean enabled) { this.enabled = enabled; }
     public Instant getCreatedAt() { return createdAt; }
     public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
+    public Instant getSupersededAt() { return supersededAt; }
+    public void setSupersededAt(Instant supersededAt) { this.supersededAt = supersededAt; }
 }

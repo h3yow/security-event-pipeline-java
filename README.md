@@ -3,6 +3,8 @@
 把来自不同来源（防火墙 / 认证服务）的原始日志**归一化**为统一事件，基于事件时间窗口做**关联检测**，
 并对命中结果进行**去重、合并、抑制**与**告警状态机**管理。异常输入不静默丢弃（全部审计留痕），
 同一事件在并发/重试下只处理一次，服务重启后窗口计数与告警状态不丢失、不回退、不重复累计。
+同窗口几十条不同事件并发补录/重放时去重计数不重不漏；并提供面向运维的**窗口对账查询**
+（按规则版本/分组/区间，差异精确到事件）与**幂等自愈**（可重复、可并发触发，全程审计留痕）。
 
 - Java 21 + Spring Boot 3.4 + Spring Data JPA + H2（文件库，零外部依赖，本地可直接运行）
 - 全部状态（事件、拒绝记录、规则版本、窗口计数、告警、状态流转）持久化在 `./data/pipelinedb`
@@ -14,7 +16,7 @@
 ```bash
 mvn spring-boot:run            # 或 mvn package && java -jar target/security-event-pipeline-1.0-SNAPSHOT.jar
 # 服务监听 http://localhost:8080，首次启动自动写入 3 条演示规则
-mvn test                       # 运行全部测试（13 个用例）
+mvn test                       # 运行全部测试（25 个用例）
 ```
 
 重置本地数据：停止服务后删除 `./data` 目录。
@@ -150,10 +152,13 @@ actor / action / target / sourceIp / attributes / rawPayload`。
 
 ### 3.3 计数在并发下不重不漏
 
-- JVM 内按窗口键（`ruleId#version#groupKey#windowStart`）加锁串行化同窗口更新；
-- 关联表 `window_event(rule_id, window_key, event_id)` 有**唯一约束**，采用“先查后插 + 约束兜底”，
+- JVM 内按窗口键（`ruleId#version#groupKey#windowStart`）加锁，锁在**数据库事务之外**、
+  按窗口键全局一致排序获取：同窗口读-改-写完全串行，同事件可命中多个窗口时也不会交叉死锁；
+- 关联表 `window_event(rule_id, window_key, event_id)` 有**唯一约束**兜底（多实例/极端竞态），
   保证每个事件对每个窗口只贡献一次计数；
-- 聚合计数与窗口-事件关联全部落库，**重启后继续累计**，不回退、不重复。
+- 聚合计数与窗口-事件关联全部落库，**重启后继续累计**，不回退、不重复；
+- 因此同一窗口几十条**不同**事件并发补录时每条都能成功受理（不会在事务内撞唯一约束而整体回滚），
+  最终去重计数恰好等于成功受理数；相同事件重试仍只算一次。
 
 ### 3.4 规则变更后历史判定依据可追溯
 
@@ -162,6 +167,89 @@ actor / action / target / sourceIp / attributes / rawPayload`。
 规则随后如何修改，历史告警展示的都始终是它被判定时的依据。
 查询：`GET /api/rules/{ruleCode}/history`、`GET /api/audit/windows`、告警详情中的
 `ruleVersion` 与 `ruleSnapshotJson`。
+
+### 3.5 窗口统计对账与自愈（运维）
+
+并发补录、历史重放、手工修库或版本升级后，运维可以**按规则（含当时版本）、分组和窗口区间**
+对窗口统计做对账，并对不一致的窗口发起**幂等自愈**。
+
+#### 3.5.1 对账查询 `GET /api/audit/windows/reconcile`
+
+查询参数（全部可选；`from/to` 为窗口起点的 epoch 秒闭区间）：
+
+```
+?ruleCode=AUTH_BRUTE_FORCE&version=1&groupKey=bob&from=1790601600&to=1790605200
+```
+
+对账对每个窗口聚合，用**当时的规则版本快照**对「全部已受理事件」重新匹配（事件时间落入窗口、
+匹配条件与分组一致、且**事件是在该版本生效期间受理的**——升级后受理的事件不会“穿越”进旧版本窗口），
+复算该窗口**应当**纳入的去重事件集合，再与实际落库数据逐项对比。返回字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `windowKey` | `ruleId#v版本#分组#窗口起点`，窗口全局唯一标识 |
+| `storedCount` | window_aggregate 当前统计值 |
+| `uniqueEventCount` | 复算后**实际应参与判定**的去重事件数（权威值） |
+| `countDiff` | `storedCount - uniqueEventCount`，非 0 即统计有偏差 |
+| `missingEventIds` | 已受理、应计入但 window_event 里**缺失**的事件（少算） |
+| `unexpectedEventIds` | window_event 里**多挂**的事件（重复算/错挂） |
+| `fired` / `shouldFire` | 当前是否已触发 / 按权威计数是否应达阈值 |
+| `countConsistent` / `firingConsistent` / `consistent` | 计数一致 / 触发一致 / 总体一致 |
+| `matchedAlertId` / `alert` | aggregate 记录的告警ID与该告警简要（状态、occurrenceCount、窗口数） |
+| `contributions` | **每个事件对统计的贡献摘要**：eventId、事件时间、受理时间、actor/action/target/sourceIp |
+
+差异精确到事件 ID，而不是只给一个总数；结果按「规则→版本→分组→窗口起点」稳定排序，可解释、可复现。
+
+#### 3.5.2 发起自愈 `POST /api/audit/windows/heal`
+
+```bash
+curl -X POST http://localhost:8080/api/audit/windows/heal \
+  -H 'Content-Type: application/json' -H 'X-Operator: alice' \
+  -d '{"ruleCode":"AUTH_BRUTE_FORCE","groupKey":"bob","reason":"巡检发现计数漂移"}'
+```
+
+请求体字段全部可选（省略即扫描全部窗口）：`ruleCode / version / groupKey / from / to / reason`。
+对范围内每个窗口，在**独立短事务**内把三层状态收敛到「按已受理去重事件」的正确结果：
+
+1. **关联表**：补齐 `missingEventIds` 对应的 window_event（只补已受理事件），摘除 `unexpectedEventIds`；
+2. **聚合计数**：`count = 去重事件数`、`fired = count >= 当时阈值`、回写正确的 `matchedAlertId`；
+3. **告警**：
+   - 达阈值且已有**活跃**告警携带该窗口 → 复用，**不重复创建、不重复累计 occurrenceCount**
+     （RESOLVED 是终态，不算“仍适用”，会另建新警，与实时语义一致）；
+   - 达阈值但无活跃告警 → 按规则动作（ALERT/SUPPRESS）补建，`occurrenceCount=1`；
+   - 未达阈值却挂着告警（误报）→ 摘除窗口键；该告警再无其他窗口支撑时自动 `RESOLVED`，
+     仍支撑其他窗口则保留。告警状态真正变化时写 `alert_transition`（operatorRole=`HEALING`）。
+
+**并发与重试语义**：
+
+- 自愈与实时接入共用同一套窗口锁（按窗口键全局一致排序加锁），自愈之间、自愈与并发补录/重放
+  互不覆盖、无死锁；每个窗口的修复是独立事务，一个窗口失败不影响其它窗口；
+- **可重复触发、可并发触发**：收敛逻辑基于“应然集合”做差集，窗口已正确时 `changed=false`、零写入；
+  多次/并发执行后计数与告警状态完全一致（并发下只有一次实际改数据，其余读到的已是修复后状态）；
+- 每次调用都**只追加**一条 `window_heal_audit` 审计：何时（triggeredAt）、谁（X-Operator）、
+  因何（reason）、扫描/修复窗口数、每个窗口 added/removed/count 前后/fired 前后/alertAction；
+  查询：`GET /api/audit/windows/heals`。
+
+> 自愈只按**已受理事件**收敛；曾被归一化/迟到策略拒绝的事件不在其中（拒绝记录仍以
+> `GET /api/audit/rejected` 为准），自愈不会让被拒绝事件“复活”。
+
+### 3.6 并发补录与重放：不重不漏
+
+- 同一规则、同一分组、同一时间窗口允许几十条**不同**事件并发提交/历史补入：窗口锁在数据库事务
+  **之外**按窗口键串行化同窗口读-改-写，因此每条事件都能成功受理，且最终
+  `window_aggregate.count` 与 window_event 去重关联数都**恰好等于成功受理数**，不多不少；
+- 相同事件的并发重试：事件级分段锁 + `uk_event_id` 唯一约束双层保证只受理一次（仅 1 个 200，
+  其余 409），窗口只计一次；
+- 乱序/迟到语义不变：以事件时间对齐窗口、以接入时刻判定迟到宽限，重放结论与首次一致。
+
+### 3.7 兼容范围（升级不丢数据、不清库）
+
+- 全部 schema 变更是**增量加列/加表**（`detection_rule.superseded_at`、`window_heal_audit`），
+  `ddl-auto=update` 在已有文件库上直接生效，**不需要清库或重导**；
+- 旧规则版本行 `superseded_at` 为空：表示它们是升级前写入的历史版本，对账时仅按
+  「受理时刻不早于版本创建时刻」界定，历史窗口结论保持不变；
+- 既有接口、规则语义、告警状态机、审计端点行为不变；新端点为纯增量。
+
 
 ---
 
@@ -222,7 +310,10 @@ curl -X POST http://localhost:8080/api/alerts/1/transition \
 | `POST /api/alerts/{id}/transition` | 告警状态流转（需 X-Operator[-Role] 头） |
 | `GET  /api/audit/rejected` | 被拒绝记录审计（原因可区分） |
 | `GET  /api/audit/windows` | 窗口聚合计数（判定依据） |
-| `GET  /api/audit/alerts/{id}/transitions` | 告警状态流转审计 |
+| `GET  /api/audit/windows/reconcile` | 窗口对账：统计 vs 实际去重事件的逐项差异与贡献摘要（支持 ruleCode/version/groupKey/from/to） |
+| `POST /api/audit/windows/heal` | 对（不一致的）窗口发起幂等自愈（X-Operator 记审计） |
+| `GET  /api/audit/windows/heals` | 自愈审计记录（何时/谁/因何/处理了哪些窗口） |
+| `GET  /api/audit/alerts/{id}/transitions` | 告警状态流转审计（含自愈触发的 HEALING 流转） |
 
 ---
 
@@ -248,16 +339,41 @@ curl -X POST localhost:8080/api/alerts/1/transition -H 'X-Operator-Role: VIEWER'
   -H 'Content-Type: application/json' -d '{"targetStatus":"ACKNOWLEDGED"}'   # 403
 ```
 
-### 6.2 自动化测试（`mvn test`，共 14 个用例）
+### 6.2 自动化测试（`mvn test`，共 25 个用例）
 
 | 测试类 | 覆盖内容 |
 | --- | --- |
 | `NormalizerTest`（5） | 必填缺失、非法时间戳、时间戳越界、未知来源、正常归一化 |
 | `PipelineIntegrationTest`（5） | **16 线程并发同一事件只接受 1 次**；**乱序事件窗口计数稳定且只建 1 警**；**迟到超宽限被拒（WINDOW_EXPIRED）且拒绝留痕、事件不落库**；**非法流转(422)与越权(403)被正确归类、状态不变**；相邻窗口命中在 dedup 间隔内合并为 1 条告警 |
+| `ReconciliationHealingTest`（10） | **30 条不同事件 16 线程并发补录全部受理、去重计数恰好=受理数、只建 1 警**；**3 事件×8 线程并发重复重试每事件只计 1 次**；健康窗口对账一致且含逐事件贡献摘要；漂移窗口对账精确报出 missing/unexpected 与 countDiff；**自愈收敛计数且二次触发零变更（幂等）**；达阈值缺告警补建且不重复；未达阈值误报自动 RESOLVED 并留 HEALING 流转；**8 线程并发自愈只有一次实际改数据、结果一致且每次留审计**；按规则版本对账（阈值/版本正确、升级后事件不穿越进旧窗口）；对账/自愈/审计三个 HTTP 端点 |
 | `RuleVersioningTest`（1） | 规则变更产生 v2、v1 保留；历史告警仍引用 v1 与阈值=4 的快照；新事件按 v2 判定 |
 | `RestartPersistenceTest`（1） | 两个 Spring 上下文顺序启动同一文件库：ACK 状态与计数重启后保留；重放旧事件仍判重且计数不变；新事件继续累计并关联原告警 |
 | `HttpApiTest`（1） | HTTP 层状态码/原因归类：400/409/403/422/404，响应体结构与审计端点 |
 | `ApplicationTests`（1） | 上下文加载冒烟测试 |
+
+### 6.3 对账与自愈手工复现
+
+```bash
+mvn spring-boot:run
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# 1) 20 条不同事件并发补录到同一窗口
+seq 0 19 | xargs -P 16 -I{} curl -s -X POST localhost:8080/api/events \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\":\"AUTH\",\"payload\":{\"eventId\":\"live-{}\",\"timestamp\":\"$TS\",\
+\"username\":\"liveuser\",\"result\":\"LOGIN_FAIL\",\"service\":\"ssh\"}}"
+# 2) 对账：storedCount=uniqueEventCount=20, countDiff=0, consistent=true, 含 20 条 contributions
+curl -s "localhost:8080/api/audit/windows/reconcile?ruleCode=AUTH_BRUTE_FORCE&groupKey=liveuser"
+# 3) 自愈（健康窗口 healedWindows=0，证明幂等）；可重复调用，结果一致
+curl -s -X POST localhost:8080/api/audit/windows/heal -H 'Content-Type: application/json' \
+  -H 'X-Operator: alice' -d '{"groupKey":"liveuser","reason":"巡检"}'
+# 4) 查看每次自愈的审计记录
+curl -s localhost:8080/api/audit/windows/heals
+# 5) 相同事件并发重试 => 恰好 1 个 200，其余 409，窗口计数只 +1
+seq 1 12 | xargs -P 12 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8080/api/events \
+  -H 'Content-Type:application/json' \
+  -d "{\"source\":\"AUTH\",\"payload\":{\"eventId\":\"same-evt\",\"timestamp\":\"$TS\",\
+\"username\":\"dupuser\",\"result\":\"LOGIN_FAIL\",\"service\":\"ssh\"}}" | sort | uniq -c
+```
 
 测试日志中打印了 **输入事件**（`[输入事件]`）、**判定依据**（`[判定依据]`：匹配规则、窗口区间、
 count/threshold/命中、拒绝原因）与**最终状态**（`[最终状态]`：计数、fired、告警状态），

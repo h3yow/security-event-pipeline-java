@@ -20,4 +20,11 @@ public record NormalizedEvent(
         Map<String, String> attributes,
         String rawPayload
 ) {
+
+    /** 转为规则匹配所需的只读视图。 */
+    public EventView asView() {
+        return new StoredEventView(eventId, source == null ? null : source.name(),
+                eventTime, actor, action, target, sourceIp,
+                attributes == null ? Map.of() : attributes);
+    }
 }
