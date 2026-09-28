@@ -131,4 +131,78 @@ class ConcurrentBackfillTest {
         assertEquals(1, alertRepository.findAll().stream().filter(a -> a.getGroupKey().equals("nora")).count(),
                 "同窗口并发只应产生一条告警");
     }
+
+    @Test
+    void concurrentBackfillMixedWithDuplicateRetriesCountsEachEventOnce() throws Exception {
+        // 40 条不同事件 + 对其中 10 条各 3 次额外并发重试（相同事件重试只算一次）
+        Instant ts = Instant.now().truncatedTo(ChronoUnit.MINUTES).plusSeconds(40);
+        int distinct = 40;
+        int retriesPerEvent = 3;
+        List<EventIngestRequest> requests = new ArrayList<>();
+        for (int i = 1; i <= distinct; i++) {
+            requests.add(auth("mix-mia-" + i, ts, "mia"));
+        }
+        for (int r = 0; r < retriesPerEvent; r++) {
+            for (int i = 1; i <= 10; i++) {
+                requests.add(auth("mix-mia-" + i, ts, "mia")); // 与首次提交完全相同
+            }
+        }
+        Collections.shuffle(requests);
+        log.info("[输入事件] 同窗口混合并发：{} 条不同事件 + {} 条相同事件重试，共 {} 次提交",
+                distinct, 10 * retriesPerEvent, requests.size());
+
+        ExecutorService pool = Executors.newFixedThreadPool(24);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(requests.size());
+        AtomicInteger accepted = new AtomicInteger();
+        AtomicInteger duplicates = new AtomicInteger();
+        AtomicInteger otherErrors = new AtomicInteger();
+        List<String> errorDetails = Collections.synchronizedList(new ArrayList<>());
+
+        for (EventIngestRequest req : requests) {
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    IngestResult r = ingestionService.ingest(req);
+                    if (r.accepted()) {
+                        accepted.incrementAndGet();
+                    } else {
+                        otherErrors.incrementAndGet();
+                        errorDetails.add("REJECTED:" + r.rejection().reason());
+                    }
+                } catch (DuplicateEventException e) {
+                    duplicates.incrementAndGet();
+                } catch (Exception e) {
+                    otherErrors.incrementAndGet();
+                    errorDetails.add("ERROR:" + e.getClass().getSimpleName());
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+        start.countDown();
+        assertTrue(done.await(60, TimeUnit.SECONDS));
+        pool.shutdown();
+
+        WindowAggregateEntity window = windowAggregateRepository.findAll().stream()
+                .filter(w -> w.getGroupKey().equals("mia")).findFirst().orElseThrow();
+        long windowRows = windowEventRepository.findAll().stream()
+                .filter(we -> we.getWindowKey().equals(window.getRuleId()
+                        + "#v" + window.getVersion() + "#mia#" + window.getWindowStart())).count();
+        long acceptedRows = eventRepository.count();
+
+        log.info("[判定依据] 成功受理={}, 重复重试={}, 其它异常={}",
+                accepted.get(), duplicates.get(), otherErrors.get());
+        log.info("[最终状态] accepted_event 行={}, window_event 去重行={}, count={}, fired={}, 告警数={}",
+                acceptedRows, windowRows, window.getCount(), window.isFired(),
+                alertRepository.findAll().stream().filter(a -> a.getGroupKey().equals("mia")).count());
+
+        assertEquals(0, otherErrors.get(), "除重复外不应有其它异常: " + errorDetails.stream().sorted().distinct().toList());
+        assertEquals(distinct, accepted.get(), "只有不同事件被受理");
+        assertEquals(10 * retriesPerEvent, duplicates.get(), "30 次相同事件重试全部判为重复");
+        assertEquals(distinct, acceptedRows, "每个不同事件只落库一次");
+        assertEquals(distinct, windowRows, "窗口去重事件数=40，重试不重复算");
+        assertEquals(distinct, window.getCount(), "统计值=40，不少算不重复算");
+        assertEquals(1, alertRepository.findAll().stream().filter(a -> a.getGroupKey().equals("mia")).count());
+    }
 }
