@@ -8,6 +8,7 @@ import com.github.h3yow.securityeventpipelinejava.entity.EventEntity;
 import com.github.h3yow.securityeventpipelinejava.entity.RuleEntity;
 import com.github.h3yow.securityeventpipelinejava.entity.WindowAggregateEntity;
 import com.github.h3yow.securityeventpipelinejava.entity.WindowEventEntity;
+import com.github.h3yow.securityeventpipelinejava.exception.DuplicateEventException;
 import com.github.h3yow.securityeventpipelinejava.exception.ValidationException;
 import com.github.h3yow.securityeventpipelinejava.repository.EventRepository;
 import com.github.h3yow.securityeventpipelinejava.repository.RuleRepository;
@@ -17,15 +18,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * 基于时间窗口的关联检测引擎。
@@ -41,9 +40,11 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * <h3>并发正确性</h3>
  * <ul>
- *   <li>JVM 内按窗口键加锁串行化同窗口更新；</li>
- *   <li>window_event(rule_id,window_key,event_id) 唯一约束 + 先查后插保证每个事件对每个窗口只计一次，
- *       计数不重复不遗漏；</li>
+ *   <li>JVM 内按窗口键加锁，且<b>锁覆盖整个事务直到提交</b>（见 {@link WindowLockManager}），
+ *       同一窗口的不同事件并发补录时，"读聚合→写关联→改计数"完全串行化，
+ *       不会出现聚合行唯一约束冲突或计数丢失更新；</li>
+ *   <li>一个事件命中多个规则时按窗口键字典序统一加锁，固定加锁顺序避免死锁；</li>
+ *   <li>window_event(rule_id,window_key,event_id) 唯一约束作为兜底，每个事件对每个窗口只计一次；</li>
  *   <li>所有计数与告警落库，重启后可继续累计（不会回退或重复累计）。</li>
  * </ul>
  */
@@ -59,8 +60,8 @@ public class DetectionService {
     private final WindowEventRepository windowEventRepository;
     private final AlertService alertService;
     private final JsonService jsonService;
-
-    private final Map<String, Lock> windowLocks = new ConcurrentHashMap<>();
+    private final WindowLockManager windowLockManager;
+    private final TransactionTemplate transactionTemplate;
 
     public DetectionService(RuleService ruleService,
                             EventRepository eventRepository,
@@ -68,7 +69,9 @@ public class DetectionService {
                             WindowAggregateRepository aggregateRepository,
                             WindowEventRepository windowEventRepository,
                             AlertService alertService,
-                            JsonService jsonService) {
+                            JsonService jsonService,
+                            WindowLockManager windowLockManager,
+                            PlatformTransactionManager transactionManager) {
         this.ruleService = ruleService;
         this.eventRepository = eventRepository;
         this.ruleRepository = ruleRepository;
@@ -76,39 +79,47 @@ public class DetectionService {
         this.windowEventRepository = windowEventRepository;
         this.alertService = alertService;
         this.jsonService = jsonService;
+        this.windowLockManager = windowLockManager;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
+    }
+
+    /** 待处理的一次规则命中：规则 + 所属窗口键。 */
+    private record PendingWindow(RuleEntity rule, WindowKey key, long windowEnd) {
     }
 
     /**
-     * 单一事务内完成：事件落库 + 全部规则的窗口计数/建警。
-     * 任一步骤抛出运行时异常都会整体回滚（重复事件由接入层先判 + 唯一约束兜底）。
+     * 事件落库 + 全部命中规则的窗口计数/建警，原子完成。
+     *
+     * <p>先做匹配与迟到预检（不写库），再在<b>覆盖事务全程的窗口锁</b>内执行一个事务：
+     * 事件插入与所有窗口更新要么全部生效，要么（如事件重复、窗口过期）全部不生效。
      */
-    @Transactional
     public List<Long> processEvent(NormalizedEvent event) {
-        EventEntity entity = new EventEntity();
-        entity.setEventId(event.eventId());
-        entity.setSource(event.source().name());
-        entity.setEventTime(event.eventTime());
-        entity.setIngestTime(event.ingestTime());
-        entity.setActor(event.actor());
-        entity.setAction(event.action());
-        entity.setTarget(event.target());
-        entity.setSourceIp(event.sourceIp());
-        entity.setAttributesJson(jsonService.write(event.attributes()));
-        entity.setRawPayload(event.rawPayload());
-        try {
-            eventRepository.saveAndFlush(entity);
-        } catch (DataIntegrityViolationException dup) {
-            // 极端并发下由唯一约束兜底：同一事件只会被接受一次
-            log.warn("event_id 唯一约束判定重复: eventId={}", event.eventId());
-            throw new com.github.h3yow.securityeventpipelinejava.exception.DuplicateEventException(
-                    event.eventId());
+        List<PendingWindow> pending = matchWindows(event);
+        if (pending.isEmpty()) {
+            // 未命中任何规则：事件照常受理落库，只是不产生窗口计数/告警
+            List<Long> empty = new ArrayList<>();
+            transactionTemplate.executeWithoutResult(status -> insertAcceptedEvent(event));
+            return empty;
         }
-        return evaluate(event);
+
+        List<String> windowKeys = pending.stream().map(p -> p.key().encode()).sorted().distinct().toList();
+        List<Long> alertIds = new ArrayList<>();
+        windowLockManager.runLocked(windowKeys, () ->
+                transactionTemplate.executeWithoutResult(status -> {
+                    insertAcceptedEvent(event);
+                    for (PendingWindow p : pending) {
+                        Long alertId = accumulateWindow(p.rule(), p.key(), p.windowEnd(), event);
+                        if (alertId != null && !alertIds.contains(alertId)) {
+                            alertIds.add(alertId);
+                        }
+                    }
+                }));
+        return alertIds;
     }
 
-    @Transactional
-    public List<Long> evaluate(NormalizedEvent event) {
-        List<Long> alertIds = new ArrayList<>();
+    /** 计算事件命中的全部窗口，并在写库前完成迟到判定（语义同原检测期拒绝）。 */
+    private List<PendingWindow> matchWindows(NormalizedEvent event) {
+        List<PendingWindow> pending = new ArrayList<>();
         for (RuleEntity rule : ruleService.activeRules()) {
             RuleMatch match = match(rule, event);
             if (match == null) {
@@ -128,102 +139,108 @@ public class DetectionService {
                         event.eventId(), Instant.ofEpochSecond(windowStart), Instant.ofEpochSecond(windowEnd),
                         rule.getRuleCode(), rule.getAllowedLatenessSeconds()));
             }
-
-            Long alertId = accumulateWindow(rule, key, windowEnd, event);
-            if (alertId != null && !alertIds.contains(alertId)) {
-                alertIds.add(alertId);
-            }
+            pending.add(new PendingWindow(rule, key, windowEnd));
         }
-        return alertIds;
+        return pending;
     }
 
+    private void insertAcceptedEvent(NormalizedEvent event) {
+        EventEntity entity = new EventEntity();
+        entity.setEventId(event.eventId());
+        entity.setSource(event.source().name());
+        entity.setEventTime(event.eventTime());
+        entity.setIngestTime(event.ingestTime());
+        entity.setActor(event.actor());
+        entity.setAction(event.action());
+        entity.setTarget(event.target());
+        entity.setSourceIp(event.sourceIp());
+        entity.setAttributesJson(jsonService.write(event.attributes()));
+        entity.setRawPayload(event.rawPayload());
+        try {
+            eventRepository.saveAndFlush(entity);
+        } catch (DataIntegrityViolationException dup) {
+            // 极端并发下由唯一约束兜底：同一事件只会被接受一次
+            log.warn("event_id 唯一约束判定重复: eventId={}", event.eventId());
+            throw new DuplicateEventException(event.eventId());
+        }
+    }
+
+    /**
+     * 在"窗口锁 + 事务"保护下累加一个窗口。调用方必须已持有该窗口锁且处于事务中。
+     */
     private Long accumulateWindow(RuleEntity rule, WindowKey key, long windowEnd,
                                   NormalizedEvent event) {
-        Lock lock = windowLocks.computeIfAbsent(key.encode(), k -> new ReentrantLock());
-        lock.lock();
-        try {
-            boolean duplicateInWindow = windowEventRepository
-                    .existsByRuleIdAndWindowKeyAndEventId(rule.getId(), key.encode(), event.eventId());
-            if (duplicateInWindow) {
-                log.info("事件已在窗口内计过数，跳过(幂等): eventId={}, window={}",
-                        event.eventId(), key.encode());
-                return aggregateRepository
-                        .findByRuleIdAndVersionAndGroupKeyAndWindowStart(
-                                rule.getId(), key.version(), key.groupKey(), key.windowStart())
-                        .map(WindowAggregateEntity::getMatchedAlertId).orElse(null);
-            }
-
-            WindowAggregateEntity aggregate = aggregateRepository
+        boolean duplicateInWindow = windowEventRepository
+                .existsByRuleIdAndWindowKeyAndEventId(rule.getId(), key.encode(), event.eventId());
+        if (duplicateInWindow) {
+            log.info("事件已在窗口内计过数，跳过(幂等): eventId={}, window={}",
+                    event.eventId(), key.encode());
+            return aggregateRepository
                     .findByRuleIdAndVersionAndGroupKeyAndWindowStart(
                             rule.getId(), key.version(), key.groupKey(), key.windowStart())
-                    .orElseGet(() -> {
-                        WindowAggregateEntity a = new WindowAggregateEntity();
-                        a.setRuleId(rule.getId());
-                        a.setVersion(rule.getVersion());
-                        a.setGroupKey(key.groupKey());
-                        a.setWindowStart(key.windowStart());
-                        a.setWindowEnd(windowEnd);
-                        a.setCount(0);
-                        a.setThreshold(rule.getThreshold());
-                        a.setFired(false);
-                        return a;
-                    });
-
-            try {
-                // 唯一约束兜底：并发下第二个插入失败 => 不计数
-                windowEventRepository.saveAndFlush(new WindowEventEntity(
-                        rule.getId(), key.encode(), event.eventId()));
-            } catch (DataIntegrityViolationException dup) {
-                log.info("窗口关联唯一约束判定重复，跳过计数: eventId={}, window={}",
-                        event.eventId(), key.encode());
-                return aggregate.getMatchedAlertId();
-            }
-
-            aggregate.setCount(aggregate.getCount() + 1);
-            boolean reaches = aggregate.getCount() >= rule.getThreshold();
-            log.info("窗口计数: eventId={}, rule={}#v{}, group={}, window=[{},{}), count={}, threshold={}, 命中={}",
-                    event.eventId(), rule.getRuleCode(), rule.getVersion(), key.groupKey(),
-                    Instant.ofEpochSecond(key.windowStart()), Instant.ofEpochSecond(windowEnd),
-                    aggregate.getCount(), rule.getThreshold(), reaches);
-
-            Long alertId = aggregate.getMatchedAlertId();
-            if (reaches) {
-                if (alertId == null) {
-                    alertId = alertService.fireOrMerge(
-                            ruleRepository.findById(rule.getId()).orElse(rule), key, event, aggregate);
-                } else {
-                    // 已建警窗口的后续事件：计数继续，但不重复建警（窗口内只触发一次）
-                    log.info("窗口已触发过告警，后续事件仅累计: window={}, alertId={}", key.encode(), alertId);
-                }
-                aggregate.setFired(true);
-            }
-            aggregateRepository.save(aggregate);
-            return alertId;
-        } finally {
-            lock.unlock();
+                    .map(WindowAggregateEntity::getMatchedAlertId).orElse(null);
         }
+
+        WindowAggregateEntity aggregate = aggregateRepository
+                .findByRuleIdAndVersionAndGroupKeyAndWindowStart(
+                        rule.getId(), key.version(), key.groupKey(), key.windowStart())
+                .orElseGet(() -> {
+                    WindowAggregateEntity a = new WindowAggregateEntity();
+                    a.setRuleId(rule.getId());
+                    a.setVersion(rule.getVersion());
+                    a.setGroupKey(key.groupKey());
+                    a.setWindowStart(key.windowStart());
+                    a.setWindowEnd(windowEnd);
+                    a.setCount(0);
+                    a.setThreshold(rule.getThreshold());
+                    a.setFired(false);
+                    return a;
+                });
+
+        try {
+            // 唯一约束兜底：即使锁外有极端并发，第二个插入失败 => 不计数
+            windowEventRepository.saveAndFlush(new WindowEventEntity(
+                    rule.getId(), key.encode(), event.eventId()));
+        } catch (DataIntegrityViolationException dup) {
+            log.info("窗口关联唯一约束判定重复，跳过计数: eventId={}, window={}",
+                    event.eventId(), key.encode());
+            return aggregate.getMatchedAlertId();
+        }
+
+        aggregate.setCount(aggregate.getCount() + 1);
+        boolean reaches = aggregate.getCount() >= rule.getThreshold();
+        log.info("窗口计数: eventId={}, rule={}#v{}, group={}, window=[{},{}), count={}, threshold={}, 命中={}",
+                event.eventId(), rule.getRuleCode(), rule.getVersion(), key.groupKey(),
+                Instant.ofEpochSecond(key.windowStart()), Instant.ofEpochSecond(windowEnd),
+                aggregate.getCount(), rule.getThreshold(), reaches);
+
+        Long alertId = aggregate.getMatchedAlertId();
+        if (reaches) {
+            if (alertId == null) {
+                alertId = alertService.fireOrMerge(
+                        ruleRepository.findById(rule.getId()).orElse(rule), key, event, aggregate);
+            } else {
+                // 已建警窗口的后续事件：计数继续，但不重复建警（窗口内只触发一次）
+                log.info("窗口已触发过告警，后续事件仅累计: window={}, alertId={}", key.encode(), alertId);
+            }
+            aggregate.setFired(true);
+        }
+        aggregateRepository.save(aggregate);
+        return alertId;
     }
 
     /** 归一化事件是否匹配规则；匹配则返回 RuleMatch(含分组值)，否则 null。 */
     private RuleMatch match(RuleEntity rule, NormalizedEvent event) {
-        Map<String, String> conditions = jsonService.readStringMap(rule.getMatchConditionsJson());
-        for (Map.Entry<String, String> c : conditions.entrySet()) {
-            String actual = extractField(event, c.getKey());
-            if (actual == null || !actual.equals(c.getValue())) {
-                return null;
-            }
-        }
-        String groupKey = "__GLOBAL__".equals(rule.getGroupBy())
-                ? "__GLOBAL__"
-                : extractField(event, rule.getGroupBy());
-        if (groupKey == null) {
-            // 分组字段缺失无法关联，按不匹配处理（归一化阶段已保证必填字段存在）
-            return null;
-        }
-        return new RuleMatch(rule.getId(), rule.getVersion(), groupKey);
+        return WindowRuleMatcher.match(rule, event, jsonService);
     }
 
-    private String extractField(NormalizedEvent event, String field) {
+    static long floorToWindow(Instant t, long windowSeconds) {
+        long epoch = t.getEpochSecond();
+        return Math.floorDiv(epoch, windowSeconds) * windowSeconds;
+    }
+
+    /** 归一化事件字段取值（规则匹配复用）。 */
+    public static String extractField(NormalizedEvent event, String field) {
         return switch (field) {
             case "eventId" -> event.eventId();
             case "source" -> event.source().name();
@@ -233,10 +250,5 @@ public class DetectionService {
             case "sourceIp" -> event.sourceIp();
             default -> event.attributes().get(field);
         };
-    }
-
-    private long floorToWindow(Instant t, long windowSeconds) {
-        long epoch = t.getEpochSecond();
-        return Math.floorDiv(epoch, windowSeconds) * windowSeconds;
     }
 }
