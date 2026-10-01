@@ -61,6 +61,7 @@ public class DetectionService {
     private final AlertService alertService;
     private final JsonService jsonService;
     private final WindowLockManager windowLockManager;
+    private final RuleDeploymentLock deploymentLock;
     private final TransactionTemplate transactionTemplate;
 
     public DetectionService(RuleService ruleService,
@@ -71,6 +72,7 @@ public class DetectionService {
                             AlertService alertService,
                             JsonService jsonService,
                             WindowLockManager windowLockManager,
+                            RuleDeploymentLock deploymentLock,
                             PlatformTransactionManager transactionManager) {
         this.ruleService = ruleService;
         this.eventRepository = eventRepository;
@@ -80,6 +82,7 @@ public class DetectionService {
         this.alertService = alertService;
         this.jsonService = jsonService;
         this.windowLockManager = windowLockManager;
+        this.deploymentLock = deploymentLock;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
@@ -90,31 +93,40 @@ public class DetectionService {
     /**
      * 事件落库 + 全部命中规则的窗口计数/建警，原子完成。
      *
+     * <p>整个处理位于规则部署<b>读视图</b>内（与规则版本发布互斥）：读规则集、迟到判定、
+     * 受理时刻（ingestTime）确定、窗口计数与建警看到的是同一个部署版本。因此事后按
+     * {@code ingestTime 所属版本生效区间}重算归属时，与实时链路完全一致，升级边界不重不漏。
+     *
      * <p>先做匹配与迟到预检（不写库），再在<b>覆盖事务全程的窗口锁</b>内执行一个事务：
      * 事件插入与所有窗口更新要么全部生效，要么（如事件重复、窗口过期）全部不生效。
      */
     public List<Long> processEvent(NormalizedEvent event) {
-        List<PendingWindow> pending = matchWindows(event);
-        if (pending.isEmpty()) {
-            // 未命中任何规则：事件照常受理落库，只是不产生窗口计数/告警
-            List<Long> empty = new ArrayList<>();
-            transactionTemplate.executeWithoutResult(status -> insertAcceptedEvent(event));
-            return empty;
-        }
+        return deploymentLock.readView(() -> {
+            // 受理时刻在读视图内确定：它属于当前生效版本，升级时间戳被保证严格更晚
+            Instant acceptedAt = deploymentLock.acceptedAt();
+            NormalizedEvent accepted = event.withIngestTime(acceptedAt);
+            List<PendingWindow> pending = matchWindows(accepted);
+            if (pending.isEmpty()) {
+                // 未命中任何规则：事件照常受理落库，只是不产生窗口计数/告警
+                List<Long> empty = new ArrayList<>();
+                transactionTemplate.executeWithoutResult(status -> insertAcceptedEvent(accepted));
+                return empty;
+            }
 
-        List<String> windowKeys = pending.stream().map(p -> p.key().encode()).sorted().distinct().toList();
-        List<Long> alertIds = new ArrayList<>();
-        windowLockManager.runLocked(windowKeys, () ->
-                transactionTemplate.executeWithoutResult(status -> {
-                    insertAcceptedEvent(event);
-                    for (PendingWindow p : pending) {
-                        Long alertId = accumulateWindow(p.rule(), p.key(), p.windowEnd(), event);
-                        if (alertId != null && !alertIds.contains(alertId)) {
-                            alertIds.add(alertId);
+            List<String> windowKeys = pending.stream().map(p -> p.key().encode()).sorted().distinct().toList();
+            List<Long> alertIds = new ArrayList<>();
+            windowLockManager.runLocked(windowKeys, () ->
+                    transactionTemplate.executeWithoutResult(status -> {
+                        insertAcceptedEvent(accepted);
+                        for (PendingWindow p : pending) {
+                            Long alertId = accumulateWindow(p.rule(), p.key(), p.windowEnd(), accepted);
+                            if (alertId != null && !alertIds.contains(alertId)) {
+                                alertIds.add(alertId);
+                            }
                         }
-                    }
-                }));
-        return alertIds;
+                    }));
+            return alertIds;
+        });
     }
 
     /** 计算事件命中的全部窗口，并在写库前完成迟到判定（语义同原检测期拒绝）。 */

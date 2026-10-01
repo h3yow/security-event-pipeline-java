@@ -20,4 +20,12 @@ public record NormalizedEvent(
         Map<String, String> attributes,
         String rawPayload
 ) {
+    /**
+     * 返回受理时刻被替换为 ingestTime 的副本。归一化时刻只代表请求解析完成，
+     * 真正的受理时刻在规则部署读视图内确定，用于把事件归属到受理时生效的规则版本。
+     */
+    public NormalizedEvent withIngestTime(Instant ingestTime) {
+        return new NormalizedEvent(eventId, source, eventTime, ingestTime,
+                actor, action, target, sourceIp, attributes, rawPayload);
+    }
 }
