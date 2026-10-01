@@ -20,4 +20,9 @@ public record NormalizedEvent(
         Map<String, String> attributes,
         String rawPayload
 ) {
+    /** 返回一个接入时间被替换为指定值的副本（其余字段不变）。 */
+    public NormalizedEvent withIngestTime(Instant newIngestTime) {
+        return new NormalizedEvent(eventId, source, eventTime, newIngestTime,
+                actor, action, target, sourceIp, attributes, rawPayload);
+    }
 }

@@ -14,7 +14,7 @@
 ```bash
 mvn spring-boot:run            # 或 mvn package && java -jar target/security-event-pipeline-1.0-SNAPSHOT.jar
 # 服务监听 http://localhost:8080，首次启动自动写入 3 条演示规则
-mvn test                       # 运行全部测试（23 个用例）
+mvn test                       # 运行全部测试（27 个用例）
 ```
 
 重置本地数据：停止服务后删除 `./data` 目录。
@@ -166,6 +166,31 @@ actor / action / target / sourceIp / attributes / rawPayload`。
 查询：`GET /api/rules/{ruleCode}/history`、`GET /api/audit/windows`、告警详情中的
 `ruleVersion` 与 `ruleSnapshotJson`。
 
+### 3.5 事件按"受理时生效的规则版本"归属（升级边界）
+
+每个事件只计入它**被成功受理那一刻正在生效**的规则版本，规则版本的生效区间按
+**接入时刻**（`accepted_event.ingest_time`）界定：
+
+```
+版本 v 生效区间 = [ createdAt(v) , createdAt(v+1) )
+```
+
+- 升级**之前**受理的事件，只进旧版本窗口；即使事件时间与升级后事件落在同一时间桶，
+  也不会被新版本窗口计入，反之亦然——同一时间窗口内"先按 v1 提交、升级后按 v2 提交"
+  的两批事件分别归属各自版本窗口，互不串；
+- 升级**之后**才受理的事件属于新版本，永远不会出现在旧版本窗口的"应纳入"集合中，
+  旧版本窗口在升级后保持原样、稳定不变；
+- **升级边界**：事件受理时刻恰好等于新版本 `createdAt` 时，按左闭右开归**新版本**。
+
+为保证该口径在"升级与并发补录/重放交叠"时仍然确定成立，接入路径与规则升级共用
+`ruleCode` 级互斥锁（锁内读取当时生效版本、固化 `ingestTime`，并覆盖整个事务到提交）：
+升级与同规则事件的受理在该锁上线性化，因此每条事件都能唯一对应到它受理时的版本，
+**不重也不漏**；迟到判定（`WINDOW_EXPIRED`）同样在锁内按受理时刻的规则宽限执行，
+不会出现"按旧版本预检拒绝、实际已升级"的矛盾。窗口锁仍按原口径在规则锁内获取
+（固定 规则锁→窗口锁 顺序，无死锁）。
+
+> 对账/自愈对版本归属的重算与接入路径使用完全相同的区间规则（见第 8.6 节）。
+
 ---
 
 ## 4. 告警的去重、合并、抑制与状态机
@@ -254,7 +279,7 @@ curl -X POST localhost:8080/api/alerts/1/transition -H 'X-Operator-Role: VIEWER'
   -H 'Content-Type: application/json' -d '{"targetStatus":"ACKNOWLEDGED"}'   # 403
 ```
 
-### 6.2 自动化测试（`mvn test`，共 23 个用例）
+### 6.2 自动化测试（`mvn test`，共 27 个用例）
 
 | 测试类 | 覆盖内容 |
 | --- | --- |
@@ -265,6 +290,7 @@ curl -X POST localhost:8080/api/alerts/1/transition -H 'X-Operator-Role: VIEWER'
 | `WindowSelfHealTest`（4） | **修复收敛且重复触发幂等（0 变更、不重复建警、每次留审计）**；**未达阈值误报被删除且不会重建**；**8 并发修复仅第一次变更、最终一致**；跨分组错误并入的窗口归属被识别并解除（不误删真实告警） |
 | `ReconciliationHttpApiTest`（1） | 对账/自愈/审计列表端点状态码与响应体；未知规则版本 404 |
 | `RuleVersioningTest`（1） | 规则变更产生 v2、v1 保留；历史告警仍引用 v1 与阈值=4 的快照；新事件按 v2 判定 |
+| `RuleVersionReconciliationTest`（4） | **升级前后同窗口事件按受理时刻归属 v1/v2，对账计数与 missing/orphan 清单正确、重复自愈幂等**；**升级边界（ingestTime==createdAt）事件归新版本**；**未知版本 404 且列出可用版本、空版本返回空窗口列表**；**升级与并发补录交叠不重不漏 + 6 次并发自愈 0 变更、告警不重复创建** |
 | `RestartPersistenceTest`（1） | 两个 Spring 上下文顺序启动同一文件库：ACK 状态与计数重启后保留；重放旧事件仍判重且计数不变；新事件继续累计并关联原告警 |
 | `HttpApiTest`（1） | HTTP 层状态码/原因归类：400/409/403/422/404，响应体结构与审计端点 |
 | `ApplicationTests`（1） | 上下文加载冒烟测试 |
@@ -305,6 +331,10 @@ count/threshold/命中、拒绝原因）与**最终状态**（`[最终状态]`�
 - `storedCount`：`window_aggregate` 里当前统计值；
 - `actualUniqueCount`：`window_event` 去重关联行数——**这次判定实际纳入的唯一事件数**；
 - `expectedCount`：用**当时的规则版本**对已受理事件（`accepted_event`）重新匹配/分桶算出的理论值。
+  重算时除"事件时间落在窗口 + 条件匹配 + 分组一致"外，还强制**版本归属**：
+  只取受理时刻（`ingest_time`）满足 `createdAt(v) <= ingest_time < createdAt(v+1)` 的事件
+  （见 3.5 节）。因此升级后才受理的事件不会被旧版本窗口判成 `MISSING`，
+  升级前受理的事件也不会被新版本窗口判成 `MISSING`，旧窗口升级后对账结果保持稳定。
 
 差异不只给总数，而是逐条列出并给出布尔标记：
 
@@ -344,8 +374,9 @@ curl 'http://localhost:8080/api/audit/windows/reconciliation?ruleCode=AUTH_BRUTE
 
 **修复语义**（以"已受理的去重事件"为权威，不重新校验迟到，不改 `accepted_event`）：
 
-1. 按当时规则版本重算预期事件集，补齐 `MISSING` 关联（`ADDED_MEMBER`）、
-   删除 `ORPHAN` 关联（`REMOVED_ORPHAN`）；
+1. 按当时规则版本（含 3.5 节的受理时刻版本归属区间）重算预期事件集，补齐 `MISSING`
+   关联（`ADDED_MEMBER`）、删除 `ORPHAN` 关联（`REMOVED_ORPHAN`）——
+   升级后受理的事件不会被补进旧版本窗口，反之亦然；
 2. 把统计值收敛为预期去重事件数（`COUNT_CORRECTED`）；
 3. 达到阈值：确保 `fired=true` 且存在一条**仍适用**的告警——
    优先复用已关联告警；关联错位时改挂到真正包含本窗口的告警；
@@ -369,6 +400,10 @@ curl 'http://localhost:8080/api/audit/windows/reconciliation?ruleCode=AUTH_BRUTE
   且**锁覆盖整个数据库事务直到提交**，多窗口按窗口键字典序加锁防死锁；
   锁内会重新读取并重算，因此多次（含并发）执行后结果收敛一致。审计每次触发都写一条
   （包括幂等空跑），可用 `GET /api/audit/windows/repair/audits` 查询。
+- 规则升级与接入并发交叠时另有 `ruleCode` 级锁（接入/升级互斥，顺序为 规则锁→窗口锁）：
+  每条事件按受理时刻唯一归属一个版本窗口，自愈重复/并发触发后各版本窗口的
+  **统计值、是否触发、关联告警**都与该归属严格一致——达到阈值才触发，达不到不误报，
+  已存在且仍适用的告警不重复创建、不重复累计。
 
 > 部署说明：窗口锁是 JVM 内锁，与现有接入路径一致，适用于本项目的单实例 + H2 文件库部署；
 > `window_event` 唯一约束在多实例极端竞态下继续兜底。
@@ -382,11 +417,13 @@ curl 'http://localhost:8080/api/audit/windows/reconciliation?ruleCode=AUTH_BRUTE
 
 ### 8.4 兼容范围（升级不清库）
 
-- 只**新增**表 `repair_audit`，Hibernate `ddl-auto=update` 启动自动建表；
+- 版本归属/升级边界相关修复**不新增表、不改列**：`accepted_event.ingest_time`、
+  `detection_rule.created_at`、`window_aggregate / window_event` 上已有的版本信息即足够；
   既有 `accepted_event / window_event / window_aggregate / alert / alert_window /
-  alert_transition / rejected_event / detection_rule` 表结构与数据均不变；
+  alert_transition / rejected_event / detection_rule / repair_audit` 表结构与数据均不变；
 - 既有 `/api/events`、规则语义、告警状态机、原有审计端点保持不变；旧库升级后直接可用，
-  无需清库或重导。对账/自愈读取的就是历史已落库数据与历史规则版本行。
+  无需清库或重导。对账/自愈读取的就是历史已落库数据与历史规则版本行：
+  升级前落库的历史窗口/告警仍按其当时版本正常查看与修复，升级后受理的事件不会回溯污染旧窗口。
 
 ### 8.5 本地复现
 
@@ -408,6 +445,60 @@ curl localhost:8080/api/audit/windows/repair/audits
 制造并修复不一致（演练，勿在生产直接改库）：在 H2 控制台/SQL 中删除某窗口一条
 `window_event` 行并把 `window_aggregate.count` 改成别的值 → 对账出现 `missingEventIds` 与
 `countMismatch=true` → 调 repair → 再对账 `consistent=true`，且重复 repair `changedWindows=0`。
+
+### 8.6 规则升级场景的按版本对账、边界与自愈（含复现）
+
+完整链路：**先按旧版本提交 → 升级规则 → 同一时间窗口里再提交新版本事件 → 对账 → 自愈**。
+
+```bash
+mvn spring-boot:run
+BASE=http://localhost:8080/api
+# 1) 建 v1：60s 窗口、阈值 3、迟到宽限 3600s
+curl -s -X POST $BASE/rules -H 'Content-Type: application/json' -d '{
+  "ruleCode":"VER_DEMO","name":"升级归属演示",
+  "matchConditions":{"action":"DENY"},"groupBy":"sourceIp",
+  "windowSeconds":60,"allowedLatenessSeconds":3600,"threshold":3,
+  "action":"ALERT","dedupSeconds":180,"enabled":true}'
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# 2) 升级前同窗口先受理 2 条（v1 阈值 3，不触发）
+for i in 1 2; do curl -s -X POST $BASE/events -H 'Content-Type: application/json' -d \
+  "{\"source\":\"FIREWALL\",\"payload\":{\"eventId\":\"pre-$i\",\"timestamp\":\"$TS\",\"srcIp\":\"10.9.9.9\",\"action\":\"DENY\",\"target\":\"h:22\"}}"; echo; done
+# 3) 升级：阈值 3 -> 2（产生 v2）
+curl -s -X POST $BASE/rules -H 'Content-Type: application/json' -d '{
+  "ruleCode":"VER_DEMO","name":"升级归属演示",
+  "matchConditions":{"action":"DENY"},"groupBy":"sourceIp",
+  "windowSeconds":60,"allowedLatenessSeconds":3600,"threshold":2,
+  "action":"ALERT","dedupSeconds":180,"enabled":true}'
+# 4) 升级后同一时间窗口再受理 2 条（v2 阈值 2，触发）
+for i in 1 2; do curl -s -X POST $BASE/events -H 'Content-Type: application/json' -d \
+  "{\"source\":\"FIREWALL\",\"payload\":{\"eventId\":\"post-$i\",\"timestamp\":\"$TS\",\"srcIp\":\"10.9.9.9\",\"action\":\"DENY\",\"target\":\"h:22\"}}"; echo; done
+
+# 5) 对账 v1：expected/actual/stored 都=2，missing/orphan 为空，shouldFire=false，无告警
+curl "$BASE/audit/windows/reconciliation?ruleCode=VER_DEMO&ruleVersion=1&groupKey=10.9.9.9"
+# 6) 对账 v2：expected/actual/stored 都=2，shouldFire/fired=true，关联 1 条告警
+curl "$BASE/audit/windows/reconciliation?ruleCode=VER_DEMO&ruleVersion=2&groupKey=10.9.9.9"
+# 7) 自愈（两窗口本就健康）：changedWindows=0，旧窗口统计不被抬高、不补建误报告警
+curl -s -X POST $BASE/audit/windows/repair -H 'Content-Type: application/json' -d \
+  '{"ruleCode":"VER_DEMO","groupKey":"10.9.9.9"}'
+```
+
+**升级边界**：事件受理时刻恰好等于新版本 `createdAt` 时归属新版本
+（区间为左闭右开 `[createdAt(v), createdAt(v+1))`）。
+
+**并发与重试语义**：规则升级与同规则事件的受理在 `ruleCode` 锁上互斥、且锁覆盖事务到提交，
+因此升级与并发补录交叠时，每个事件唯一归属受理时生效的版本，不重不漏；自愈可重复、可并发触发，
+锁内重读重算，多次执行后各版本窗口的计数 / 是否触发 / 关联告警完全一致。
+
+**可解释的异常结果**：查询不存在的规则编码或版本返回 404 `RULE_NOT_FOUND`，错误信息列出
+当前可用版本（如 `规则 VER_DEMO 不存在版本 v99；当前可用版本: v1, v2`）；
+规则存在但该版本尚无窗口时返回 200 且 `totalWindows=0`，不报错。历史窗口与告警在升级后
+仍可通过对应 `ruleVersion` 正常对账与修复。
+
+**自动化复现**：`RuleVersionReconciliationTest`（4 个用例）覆盖上述全过程：
+① 同窗口升级前后两批事件的 v1/v2 对账（计数、missing/orphan 清单、触发与告警）与
+重复自愈幂等；② 受理时刻恰好落在升级边界的事件归属新版本；③ 未知版本 404（列出可用版本）、
+空版本窗口返回空列表；④ 升级与并发补录交叠（事件按受理时刻归位、不重不漏、两边窗口直接一致）
+叠加 6 次并发自愈（0 变更、告警不重复创建）。
 
 ---
 

@@ -108,12 +108,17 @@ public class ReconciliationService {
                                                 String groupKey, String from, String to) {
         Instant fromInstant = parseBoundary(from, "from");
         Instant toInstant = parseBoundary(to, "to");
-        List<RuleEntity> versions = resolveRuleVersions(ruleCode, ruleVersion);
-        Set<Long> ruleIds = versions.stream().map(RuleEntity::getId).collect(Collectors.toSet());
+        // 完整版本历史用于计算每个版本"生效到何时"（下一版本 createdAt）；
+        // targets 才是本次查询限定的版本（指定 ruleVersion 时只有一个）。
+        List<RuleEntity> history = resolveRuleHistory(ruleCode);
+        List<RuleEntity> targets = ruleVersion == null
+                ? history : filterExactVersion(history, ruleCode, ruleVersion);
+        Set<Long> ruleIds = targets.stream().map(RuleEntity::getId).collect(Collectors.toSet());
+        Map<Long, Instant> effectiveUntil = effectiveUntilByRuleId(history);
 
         // 拉取相关时间范围内的已受理事件一次，供各窗口重算（窗口起点可能早于事件时间下界，
         // 因此下界回退一个最大窗口长度，保证不漏算）。
-        long maxWindowSeconds = versions.stream().mapToLong(RuleEntity::getWindowSeconds).max().orElse(0L);
+        long maxWindowSeconds = targets.stream().mapToLong(RuleEntity::getWindowSeconds).max().orElse(0L);
         Instant scanFrom = fromInstant == null ? null : fromInstant.minusSeconds(maxWindowSeconds);
         List<EventEntity> events = scanEvents(scanFrom, toInstant);
 
@@ -128,10 +133,10 @@ public class ReconciliationService {
                         .thenComparingLong(WindowAggregateEntity::getWindowStart))
                 .toList();
 
-        Map<Long, RuleEntity> ruleById = versions.stream()
+        Map<Long, RuleEntity> ruleById = targets.stream()
                 .collect(Collectors.toMap(RuleEntity::getId, r -> r));
         List<WindowReconciliation> windows = aggregates.stream()
-                .map(a -> reconcileWindow(a, ruleById.get(a.getRuleId()), events))
+                .map(a -> reconcileWindow(a, ruleById.get(a.getRuleId()), events, effectiveUntil))
                 .toList();
 
         long inconsistent = windows.stream().filter(w -> !w.consistent()).count();
@@ -146,7 +151,8 @@ public class ReconciliationService {
 
     /** 计算单个窗口的三方对账结果。 */
     private WindowReconciliation reconcileWindow(WindowAggregateEntity agg, RuleEntity rule,
-                                                 List<EventEntity> candidates) {
+                                                 List<EventEntity> candidates,
+                                                 Map<Long, Instant> effectiveUntil) {
         String windowKey = encodeWindowKey(agg);
         // 实际：window_event 去重关联行
         List<WindowEventEntity> actualRows =
@@ -154,8 +160,8 @@ public class ReconciliationService {
         Set<String> actualIds = actualRows.stream().map(WindowEventEntity::getEventId)
                 .collect(Collectors.toCollection(TreeSet::new));
 
-        // 预期：按当时规则版本对已受理事件重算
-        Set<String> expectedIds = expectedEventIds(rule, agg, candidates);
+        // 预期：按当时规则版本、且仅取受理时刻该版本仍生效的事件重算
+        Set<String> expectedIds = expectedEventIds(rule, agg, candidates, effectiveUntil);
 
         Set<String> missing = new TreeSet<>(expectedIds);
         missing.removeAll(actualIds);
@@ -196,11 +202,28 @@ public class ReconciliationService {
                 List.copyOf(missing), List.copyOf(orphan), contributions);
     }
 
-    /** 按当时规则版本，重算窗口应纳入的去重事件ID集合。 */
+    /**
+     * 按当时规则版本，重算窗口应纳入的去重事件ID集合。
+     *
+     * <p>除"事件时间落在窗口 + 匹配规则 + 分组一致"外，还必须满足<b>版本归属</b>：
+     * 事件受理时刻（ingestTime）该版本正在生效，即
+     * {@code createdAt(version) <= ingestTime < createdAt(nextVersion)}。
+     * 这样升级后才受理的事件不会进入旧版本窗口（反之亦然），旧窗口升级后保持稳定。
+     */
     private Set<String> expectedEventIds(RuleEntity rule, WindowAggregateEntity agg,
-                                         List<EventEntity> candidates) {
+                                         List<EventEntity> candidates,
+                                         Map<Long, Instant> effectiveUntil) {
+        Instant effectiveFrom = rule.getCreatedAt();
+        Instant nextVersionAt = effectiveUntil.get(rule.getId());
         Set<String> ids = new TreeSet<>();
         for (EventEntity e : candidates) {
+            Instant ingestTime = e.getIngestTime();
+            if (ingestTime.isBefore(effectiveFrom)) {
+                continue;
+            }
+            if (nextVersionAt != null && !ingestTime.isBefore(nextVersionAt)) {
+                continue;
+            }
             if (e.getEventTime().getEpochSecond() < agg.getWindowStart()
                     || e.getEventTime().getEpochSecond() >= agg.getWindowEnd()) {
                 continue;
@@ -212,6 +235,26 @@ public class ReconciliationService {
             }
         }
         return ids;
+    }
+
+    /**
+     * 计算每个规则版本行"生效到何时"：同 ruleCode 内下一版本（version+1）的 createdAt；
+     * 当前最新版本无上界（null）。版本生效区间按受理时刻解释为
+     * {@code [createdAt(v), createdAt(v+1))}，边界（恰好相等）归属新版本。
+     */
+    private Map<Long, Instant> effectiveUntilByRuleId(List<RuleEntity> history) {
+        Map<String, List<RuleEntity>> byCode = history.stream()
+                .collect(Collectors.groupingBy(RuleEntity::getRuleCode));
+        Map<Long, Instant> result = new java.util.HashMap<>();
+        byCode.values().forEach(versions -> {
+            List<RuleEntity> asc = versions.stream()
+                    .sorted(Comparator.comparingInt(RuleEntity::getVersion)).toList();
+            for (int i = 0; i < asc.size(); i++) {
+                Instant until = i + 1 < asc.size() ? asc.get(i + 1).getCreatedAt() : null;
+                result.put(asc.get(i).getId(), until);
+            }
+        });
+        return result;
     }
 
     private List<EventContribution> buildContributions(List<WindowEventEntity> actualRows,
@@ -260,24 +303,34 @@ public class ReconciliationService {
         return all;
     }
 
-    private List<RuleEntity> resolveRuleVersions(String ruleCode, Integer ruleVersion) {
+    /** 解析规则编码的完整版本历史（按版本号升序返回，便于计算生效区间）。 */
+    private List<RuleEntity> resolveRuleHistory(String ruleCode) {
         if (ruleCode == null || ruleCode.isBlank()) {
             throw new PipelineException(RejectReason.MISSING_FIELD, "对账查询必须提供 ruleCode");
         }
-        List<RuleEntity> versions = ruleService.history(ruleCode);
+        List<RuleEntity> versions = ruleService.history(ruleCode).stream()
+                .sorted(Comparator.comparingInt(RuleEntity::getVersion))
+                .toList();
         if (versions.isEmpty()) {
-            throw new PipelineException(RejectReason.RULE_NOT_FOUND, "规则不存在: " + ruleCode);
-        }
-        if (ruleVersion != null) {
-            List<RuleEntity> exact = versions.stream()
-                    .filter(r -> r.getVersion() == ruleVersion).toList();
-            if (exact.isEmpty()) {
-                throw new PipelineException(RejectReason.RULE_NOT_FOUND,
-                        "规则 " + ruleCode + " 不存在版本 v" + ruleVersion);
-            }
-            return exact;
+            throw new PipelineException(RejectReason.RULE_NOT_FOUND,
+                    "规则不存在: " + ruleCode + "（当前库中没有该 ruleCode 的任何版本）");
         }
         return versions;
+    }
+
+    /** 从完整历史中取出指定版本；不存在则给出可解释的 404（列出可用版本）。 */
+    private List<RuleEntity> filterExactVersion(List<RuleEntity> history,
+                                                String ruleCode, int ruleVersion) {
+        List<RuleEntity> exact = history.stream()
+                .filter(r -> r.getVersion() == ruleVersion).toList();
+        if (exact.isEmpty()) {
+            String available = history.stream()
+                    .map(r -> "v" + r.getVersion()).collect(Collectors.joining(", "));
+            throw new PipelineException(RejectReason.RULE_NOT_FOUND,
+                    "规则 " + ruleCode + " 不存在版本 v" + ruleVersion
+                            + "；当前可用版本: " + available);
+        }
+        return exact;
     }
 
     private static Instant parseBoundary(String value, String field) {
@@ -314,7 +367,8 @@ public class ReconciliationService {
 
     /** 一次修复选中的窗口及其上下文（规则、候选事件）。 */
     private record RepairTarget(WindowAggregateEntity agg, RuleEntity rule,
-                                List<EventEntity> candidates, WindowModel model) {
+                                List<EventEntity> candidates, WindowModel model,
+                                Map<Long, Instant> effectiveUntil) {
     }
 
     /** 单个窗口在某个时刻的对账计算中间态（对账查询与自愈共用）。 */
@@ -350,10 +404,19 @@ public class ReconciliationService {
         Instant fromInstant = parseBoundary(req.from(), "from");
         Instant toInstant = parseBoundary(req.to(), "to");
 
-        // 选择规则版本：未指定 ruleCode 时覆盖全部规则（用于全局收敛）
-        List<RuleEntity> versions = req.ruleCode() == null || req.ruleCode().isBlank()
-                ? ruleRepository.findAll()
-                : resolveRuleVersions(req.ruleCode(), req.ruleVersion());
+        // 选择规则版本：未指定 ruleCode 时覆盖全部规则（用于全局收敛）。
+        // 指定 ruleCode 时加载完整历史（用于计算版本生效区间），再按 ruleVersion 过滤目标。
+        Map<Long, Instant> effectiveUntil;
+        List<RuleEntity> versions;
+        if (req.ruleCode() == null || req.ruleCode().isBlank()) {
+            versions = ruleRepository.findAll();
+            effectiveUntil = effectiveUntilByRuleId(versions);
+        } else {
+            List<RuleEntity> history = resolveRuleHistory(req.ruleCode());
+            effectiveUntil = effectiveUntilByRuleId(history);
+            versions = req.ruleVersion() == null
+                    ? history : filterExactVersion(history, req.ruleCode(), req.ruleVersion());
+        }
         Set<Long> ruleIds = versions.stream().map(RuleEntity::getId).collect(Collectors.toSet());
         long maxWindowSeconds = versions.stream().mapToLong(RuleEntity::getWindowSeconds).max().orElse(0L);
         Instant scanFrom = fromInstant == null ? null : fromInstant.minusSeconds(maxWindowSeconds);
@@ -364,7 +427,7 @@ public class ReconciliationService {
 
         // 先在事务外（只读短事务）选出目标窗口，拿到稳定的窗口键集合用于加锁
         List<RepairTarget> targets = selectTargets(
-                ruleById, ruleIds, req.groupKey(), fromInstant, toInstant, events);
+                ruleById, ruleIds, req.groupKey(), fromInstant, toInstant, events, effectiveUntil);
         List<String> windowKeys = targets.stream()
                 .map(t -> t.model().windowKey).sorted().distinct().toList();
 
@@ -383,7 +446,7 @@ public class ReconciliationService {
                 if (agg == null) {
                     continue;
                 }
-                WindowModel model = computeModel(agg, t.rule(), t.candidates());
+                WindowModel model = computeModel(agg, t.rule(), t.candidates(), t.effectiveUntil());
                 // onlyInconsistent 在锁内再次判定，保证与最新状态一致
                 if (onlyInconsistent && model.consistent(
                         agg.getCount(), agg.isFired(), agg.getMatchedAlertId())) {
@@ -420,7 +483,8 @@ public class ReconciliationService {
 
     private List<RepairTarget> selectTargets(Map<Long, RuleEntity> ruleById, Set<Long> ruleIds,
                                              String groupKey, Instant from, Instant to,
-                                             List<EventEntity> events) {
+                                             List<EventEntity> events,
+                                             Map<Long, Instant> effectiveUntil) {
         // 选中范围内全部窗口；是否一致在锁内用最新状态判定，保证 scannedWindows 反映真实扫描范围
         return transactionTemplate.execute(status -> aggregateRepository.findAll().stream()
                 .filter(a -> ruleIds.contains(a.getRuleId()))
@@ -432,19 +496,21 @@ public class ReconciliationService {
                         .thenComparing(WindowAggregateEntity::getGroupKey)
                         .thenComparingLong(WindowAggregateEntity::getWindowStart))
                 .map(a -> new RepairTarget(a, ruleById.get(a.getRuleId()), events,
-                        computeModel(a, ruleById.get(a.getRuleId()), events)))
+                        computeModel(a, ruleById.get(a.getRuleId()), events, effectiveUntil),
+                        effectiveUntil))
                 .toList());
     }
 
     /** 计算窗口实际/预期集合与差异（不写库）。 */
     private WindowModel computeModel(WindowAggregateEntity agg, RuleEntity rule,
-                                     List<EventEntity> candidates) {
+                                     List<EventEntity> candidates,
+                                     Map<Long, Instant> effectiveUntil) {
         String windowKey = encodeWindowKey(agg);
         List<WindowEventEntity> rows =
                 windowEventRepository.findByRuleIdAndWindowKeyOrderByEventIdAsc(agg.getRuleId(), windowKey);
         TreeSet<String> actualIds = rows.stream().map(WindowEventEntity::getEventId)
                 .collect(Collectors.toCollection(TreeSet::new));
-        Set<String> expectedIds = expectedEventIds(rule, agg, candidates);
+        Set<String> expectedIds = expectedEventIds(rule, agg, candidates, effectiveUntil);
         List<EventEntity> windowEvents = candidates.stream()
                 .filter(e -> expectedIds.contains(e.getEventId()))
                 .sorted(Comparator.comparing(EventEntity::getEventTime).thenComparing(EventEntity::getEventId))

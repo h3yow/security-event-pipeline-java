@@ -7,7 +7,8 @@ import com.github.h3yow.securityeventpipelinejava.exception.PipelineException;
 import com.github.h3yow.securityeventpipelinejava.repository.RuleRepository;
 import com.github.h3yow.securityeventpipelinejava.web.RuleUpsertRequest;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
 import java.util.Comparator;
@@ -25,10 +26,16 @@ public class RuleService {
 
     private final RuleRepository ruleRepository;
     private final JsonService jsonService;
+    private final WindowLockManager windowLockManager;
+    private final TransactionTemplate transactionTemplate;
 
-    public RuleService(RuleRepository ruleRepository, JsonService jsonService) {
+    public RuleService(RuleRepository ruleRepository, JsonService jsonService,
+                       WindowLockManager windowLockManager,
+                       PlatformTransactionManager transactionManager) {
         this.ruleRepository = ruleRepository;
         this.jsonService = jsonService;
+        this.windowLockManager = windowLockManager;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
     /** 当前生效的全部规则。 */
@@ -47,9 +54,19 @@ public class RuleService {
         return ruleRepository.findByRuleCodeOrderByVersionDesc(ruleCode);
     }
 
-    @Transactional
+    /**
+     * 创建新版本。在该 ruleCode 的规则版本锁内执行一个完整事务，锁覆盖到提交：
+     * 与同 ruleCode 的事件接入互斥，{@code createdAt} 在锁内生成，
+     * 保证接入/对账按 {@code [createdAt(v), createdAt(v+1))} 的版本归属在并发升级下确定一致。
+     */
     public RuleEntity createOrUpdate(RuleUpsertRequest req) {
         validate(req);
+        return windowLockManager.<RuleEntity>callLocked(req.ruleCode(),
+                () -> transactionTemplate.execute(status -> persistNewVersion(req)));
+    }
+
+    /** 调用方必须已持有该 ruleCode 的规则锁且处于事务中。 */
+    private RuleEntity persistNewVersion(RuleUpsertRequest req) {
         RuleEntity entity = new RuleEntity();
         entity.setRuleCode(req.ruleCode());
         entity.setName(req.name());

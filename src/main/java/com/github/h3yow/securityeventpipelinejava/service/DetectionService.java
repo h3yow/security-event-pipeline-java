@@ -23,6 +23,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
@@ -90,37 +91,72 @@ public class DetectionService {
     /**
      * 事件落库 + 全部命中规则的窗口计数/建警，原子完成。
      *
-     * <p>先做匹配与迟到预检（不写库），再在<b>覆盖事务全程的窗口锁</b>内执行一个事务：
-     * 事件插入与所有窗口更新要么全部生效，要么（如事件重复、窗口过期）全部不生效。
+     * <p><b>先取全部活跃规则的 ruleCode 锁、再在锁内做匹配/迟到判定，最后取窗口锁</b>
+     * （固定"规则锁→窗口锁"顺序避免死锁）：版本选择与迟到宽限都以锁内的受理时刻
+     * （decisionTime）为准，与同 ruleCode 的规则升级互斥，杜绝"锁外按旧版本预检、
+     * 锁内已升级"的边界误判。事件 ingestTime 取 decisionTime 落库，
+     * 对账按 {@code [createdAt(v), createdAt(v+1))} 重算必然得到同一结论。
      */
     public List<Long> processEvent(NormalizedEvent event) {
-        List<PendingWindow> pending = matchWindows(event);
-        if (pending.isEmpty()) {
-            // 未命中任何规则：事件照常受理落库，只是不产生窗口计数/告警
-            List<Long> empty = new ArrayList<>();
-            transactionTemplate.executeWithoutResult(status -> insertAcceptedEvent(event));
-            return empty;
-        }
+        // 规则编码集合在锁外读取仅用于决定要取哪些 ruleCode 锁；锁内会重新读取版本
+        List<String> ruleCodes = ruleService.activeRules().stream()
+                .map(RuleEntity::getRuleCode).distinct().sorted().toList();
 
-        List<String> windowKeys = pending.stream().map(p -> p.key().encode()).sorted().distinct().toList();
-        List<Long> alertIds = new ArrayList<>();
-        windowLockManager.runLocked(windowKeys, () ->
-                transactionTemplate.executeWithoutResult(status -> {
-                    insertAcceptedEvent(event);
-                    for (PendingWindow p : pending) {
-                        Long alertId = accumulateWindow(p.rule(), p.key(), p.windowEnd(), event);
-                        if (alertId != null && !alertIds.contains(alertId)) {
-                            alertIds.add(alertId);
+        return windowLockManager.callLocked(ruleCodes, List.of(), () -> {
+            // 锁内的受理时刻：与升级创建新版本的时刻在 ruleCode 锁上线性化
+            Instant decisionTime = Instant.now();
+            List<RuleEntity> rulesAtIngest = effectiveRulesAt(decisionTime);
+            // 匹配 + 迟到判定都在规则锁内完成（可能抛 WINDOW_EXPIRED，此时尚未写库）
+            List<PendingWindow> pending = matchWindows(event, decisionTime, rulesAtIngest);
+
+            if (pending.isEmpty()) {
+                // 未命中任何规则：事件照常受理落库，只是不产生窗口计数/告警
+                List<Long> empty = new ArrayList<>();
+                transactionTemplate.executeWithoutResult(status ->
+                        insertAcceptedEvent(event.withIngestTime(decisionTime)));
+                return empty;
+            }
+
+            List<String> windowKeys = pending.stream()
+                    .map(p -> p.key().encode()).sorted().distinct().toList();
+            List<Long> alertIds = new ArrayList<>();
+            windowLockManager.runLocked(windowKeys, () ->
+                    transactionTemplate.executeWithoutResult(status -> {
+                        insertAcceptedEvent(event.withIngestTime(decisionTime));
+                        for (PendingWindow p : pending) {
+                            Long alertId = accumulateWindow(p.rule(), p.key(), p.windowEnd(), event);
+                            if (alertId != null && !alertIds.contains(alertId)) {
+                                alertIds.add(alertId);
+                            }
                         }
-                    }
-                }));
-        return alertIds;
+                    }));
+            return alertIds;
+        });
     }
 
-    /** 计算事件命中的全部窗口，并在写库前完成迟到判定（语义同原检测期拒绝）。 */
-    private List<PendingWindow> matchWindows(NormalizedEvent event) {
+    /**
+     * 给定时刻每个 ruleCode 生效的规则版本：版本历史中 {@code createdAt <= at} 的最新版本
+     * （且仍 enabled）。与对账重算的版本归属口径一致：
+     * v 版本生效区间为 {@code [createdAt(v), createdAt(v+1))}。
+     */
+    private List<RuleEntity> effectiveRulesAt(Instant at) {
+        return ruleRepository.findAll().stream()
+                .filter(RuleEntity::isEnabled)
+                .collect(java.util.stream.Collectors.groupingBy(RuleEntity::getRuleCode))
+                .values().stream()
+                .map(versions -> versions.stream()
+                        .filter(r -> !r.getCreatedAt().isAfter(at))
+                        .max(Comparator.comparingInt(RuleEntity::getVersion))
+                        .orElse(null))
+                .filter(java.util.Objects::nonNull)
+                .toList();
+    }
+
+    /** 计算事件在给定规则集合下命中的全部窗口，并完成迟到判定（写库前校验）。 */
+    private List<PendingWindow> matchWindows(NormalizedEvent event, Instant now,
+                                             List<RuleEntity> rules) {
         List<PendingWindow> pending = new ArrayList<>();
-        for (RuleEntity rule : ruleService.activeRules()) {
+        for (RuleEntity rule : rules) {
             RuleMatch match = match(rule, event);
             if (match == null) {
                 continue;
@@ -129,7 +165,6 @@ public class DetectionService {
             long windowEnd = windowStart + rule.getWindowSeconds();
             WindowKey key = new WindowKey(rule.getId(), rule.getVersion(), match.groupKey(), windowStart);
 
-            Instant now = Instant.now();
             if (now.getEpochSecond() > windowEnd + rule.getAllowedLatenessSeconds()) {
                 log.warn("迟到事件窗口已关闭被拒绝: eventId={}, rule={}#v{}, window={}, now={}, 允许迟到={}s",
                         event.eventId(), rule.getRuleCode(), rule.getVersion(), key.encode(),
